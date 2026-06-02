@@ -1,0 +1,26 @@
+# @package _global_
+
+defaults:
+  - override /data: libero_2cam_sana
+  - override /model: fastwam_sana
+  - _self_
+
+# dataloading
+batch_size: 1
+num_workers: 8
+
+# scheduler
+lr_scheduler_type: "cosine"
+# Full 2B video-expert finetune of a pretrained model: keep LR modest for
+# stability (a fresh action head at 1e-4 diverged to NaN around step ~12).
+learning_rate: 2e-5
+num_epochs: 10
+max_steps: null
+log_every: 10
+save_every: 2000
+eval_every: 200
+
+# training
+gradient_accumulation_steps: 1
+weight_decay: 1e-2
+resume: null

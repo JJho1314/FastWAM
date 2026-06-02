@@ -434,3 +434,140 @@ def run_inference(cfg: DictConfig):
     save_mp4(video, output_mp4, fps=15)
     logger.info("Saved inference video to %s", output_mp4)
     return output_mp4
+
+
+def create_fastwam_sana(
+    sana_repo_path: str,
+    video_dit,
+    action_dit,
+    vae,
+    video_dit_pretrained_path: str | None = None,
+    action_dim: int = 7,
+    proprio_dim: int | None = None,
+    text_dim: int = 2304,
+    feature_layer: int = -1,
+    train_video_expert: bool = True,
+    detach_video_feats: bool = False,
+    grad_checkpointing: bool = True,
+    video_scheduler=None,
+    action_scheduler=None,
+    loss=None,
+    model_dtype: torch.dtype = torch.bfloat16,
+    device: str = "cuda",
+):
+    """Hydra factory for the SANA-Video variant of FastWAM.
+
+    Builds a SANA-Video DiT (optionally loading pretrained 2B weights) as the
+    video world model, a cross-attention action expert, and a Wan2.1 VAE.
+    """
+    import sys
+
+    if sana_repo_path not in sys.path:
+        sys.path.insert(0, sana_repo_path)
+
+    from .models.sana import SanaVideoExpert, SanaActionExpert, FastWAMSana
+
+    def _to_dict(x, name):
+        if isinstance(x, DictConfig):
+            x = OmegaConf.to_container(x, resolve=True)
+        if x is None:
+            x = {}
+        if not isinstance(x, dict):
+            raise ValueError(f"`{name}` must resolve to a dict, got {type(x)}")
+        return x
+
+    video_dit = _to_dict(video_dit, "video_dit")
+    action_dit = _to_dict(action_dit, "action_dit")
+    vae = _to_dict(vae, "vae")
+    video_scheduler = _to_dict(video_scheduler, "video_scheduler")
+    action_scheduler = _to_dict(action_scheduler, "action_scheduler")
+    loss = _to_dict(loss, "loss")
+
+    # ---- build SANA-Video DiT ----
+    import diffusion.model.nets.sana_multi_scale_video as sana_nets
+
+    model_name = video_dit.pop("model_name", "SanaMSVideo_2000M_P2_D20")
+    factory = getattr(sana_nets, model_name)
+    dit = factory(
+        learn_sigma=False,
+        pred_sigma=False,
+        **video_dit,
+    ).to(device).to(model_dtype)
+
+    if video_dit_pretrained_path and not bool(video_dit.get("skip_load", False)):
+        payload = torch.load(video_dit_pretrained_path, map_location="cpu", weights_only=False)
+        state = payload.get("state_dict", payload) if isinstance(payload, dict) else payload
+        state = {k[len("model."):] if k.startswith("model.") else k: v for k, v in state.items()}
+        # Drop keys whose shapes don't match (e.g. the unused sincos `pos_embed`,
+        # which is resolution-dependent; this model uses RoPE instead).
+        msd = dit.state_dict()
+        shape_mismatch = [k for k, v in state.items() if k in msd and msd[k].shape != v.shape]
+        for k in shape_mismatch:
+            state.pop(k)
+        missing, unexpected = dit.load_state_dict(state, strict=False)
+        logger.info(
+            "Loaded SANA-Video weights from %s (loaded=%d, missing=%d, unexpected=%d, shape_skipped=%s)",
+            video_dit_pretrained_path, len(state), len(missing), len(unexpected), shape_mismatch,
+        )
+
+    if grad_checkpointing:
+        try:
+            from diffusion.model.utils import set_grad_checkpoint
+
+            set_grad_checkpoint(dit, gc_step=1)
+            logger.info("Enabled SANA-Video gradient checkpointing.")
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Could not enable SANA grad checkpointing: %s", e)
+
+    video_expert = SanaVideoExpert(dit, feature_layer=int(feature_layer))
+
+    # ---- build Wan2.1 VAE ----
+    from diffusion.model.wan.vae import WanVAE
+
+    vae_model = WanVAE(
+        z_dim=int(vae.get("z_dim", 16)),
+        vae_pth=vae["vae_pth"],
+        dtype=model_dtype,
+        device=device,
+    )
+
+    def _wan_vae_encode(name, vae_obj, video, device):
+        z = vae_obj.encode(video.to(device))
+        if isinstance(z, (list, tuple)):
+            z = torch.stack(list(z), dim=0)
+        return z
+
+    # ---- build action expert ----
+    action_expert = SanaActionExpert(
+        action_dim=int(action_dim),
+        hidden_size=int(action_dit.get("hidden_size", 1024)),
+        depth=int(action_dit.get("depth", 12)),
+        num_heads=int(action_dit.get("num_heads", 8)),
+        video_feat_dim=video_expert.hidden_size,
+        text_dim=int(text_dim),
+        mlp_ratio=float(action_dit.get("mlp_ratio", 4.0)),
+        max_action_len=int(action_dit.get("max_action_len", 64)),
+    ).to(device).to(model_dtype)
+
+    model = FastWAMSana(
+        video_expert=video_expert,
+        action_expert=action_expert,
+        vae=vae_model,
+        vae_name="WanVAE",
+        vae_encode_fn=_wan_vae_encode,
+        text_dim=int(text_dim),
+        proprio_dim=(None if proprio_dim is None else int(proprio_dim)),
+        device=device,
+        torch_dtype=model_dtype,
+        train_video_expert=bool(train_video_expert),
+        detach_video_feats=bool(detach_video_feats),
+        video_train_shift=float(video_scheduler.get("train_shift", 5.0)),
+        video_num_train_timesteps=int(video_scheduler.get("num_train_timesteps", 1000)),
+        action_train_shift=float(action_scheduler.get("train_shift", 5.0)),
+        action_num_train_timesteps=int(action_scheduler.get("num_train_timesteps", 1000)),
+        loss_lambda_video=float(loss.get("lambda_video", 1.0)),
+        loss_lambda_action=float(loss.get("lambda_action", 1.0)),
+    )
+    if proprio_dim is not None:
+        model.proprio_encoder = model.proprio_encoder.to(device).to(model_dtype)
+    return model
