@@ -1,0 +1,11 @@
+defaults:
+  - libero_cot_2cam
+  - _self_
+
+train:
+  return_text_tokens: true
+  text_tokenizer_path: checkpoints/Wan-AI/Wan2.1-T2V-1.3B/google/umt5-xxl
+
+# Flag picked up by `precompute_text_embeds.py` to extract `reasoning` strings
+# from parquet instead of `tasks.jsonl`.
+use_reasoning_prompts: true

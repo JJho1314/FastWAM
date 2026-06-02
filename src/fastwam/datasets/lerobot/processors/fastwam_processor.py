@@ -37,6 +37,9 @@ class FastWAMProcessor(BaseProcessor):
         # instruction transform
         drop_high_level_prob: float = 1.0,
         use_zh_instruction: bool = False,
+        # When True, return data["reasoning"] verbatim as the instruction
+        # (used by LIBERO-CoT). Falls back to data["task"] if `reasoning` is empty.
+        use_reasoning_as_instruction: bool = False,
 
         tokenizer: Optional[Any] = None,
         delta_action_dim_mask: Optional[Dict[str, List[bool]]] = None,
@@ -49,6 +52,7 @@ class FastWAMProcessor(BaseProcessor):
 
         self.drop_high_level_prob = drop_high_level_prob
         self.use_zh_instruction = use_zh_instruction
+        self.use_reasoning_as_instruction = bool(use_reasoning_as_instruction)
 
         # image
         self.train_transforms = train_transforms
@@ -125,6 +129,19 @@ class FastWAMProcessor(BaseProcessor):
         Returns:
             List[str], processed instructions
         """
+        # LIBERO-CoT path: use the dense per-frame `reasoning` field as the
+        # instruction. Reasoning strings are self-framing (<think>...</think>)
+        # so we return them verbatim without the DEFAULT_PROMPT wrap.
+        if self.use_reasoning_as_instruction:
+            reasoning = data.get("reasoning")
+            if reasoning is not None:
+                if isinstance(reasoning, (list, tuple)):
+                    # Defensive: lerobot may surface as list-of-strings per frame.
+                    reasoning = reasoning[0] if len(reasoning) > 0 else ""
+                reasoning_str = str(reasoning).strip()
+                if reasoning_str:
+                    return reasoning_str
+
         # if single instruction, convert to list
         if "coarse_task" in data:
             high_level_instruction = data["coarse_task"]

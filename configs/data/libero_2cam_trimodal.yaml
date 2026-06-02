@@ -1,0 +1,10 @@
+defaults:
+  - libero_2cam
+  - _self_
+
+train:
+  return_text_tokens: true
+  # Enables on-the-fly tokenization fallback if cache predates the new ids field.
+  # Must match the tokenizer the model uses (`tokenizer_model_id` resolves to the
+  # same local path; pass the path here for the lazy fallback).
+  text_tokenizer_path: checkpoints/Wan-AI/Wan2.1-T2V-1.3B/google/umt5-xxl

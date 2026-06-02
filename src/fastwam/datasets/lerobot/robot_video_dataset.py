@@ -42,6 +42,15 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         max_padding_retry: int = 3,
         concat_multi_camera: str = "horizontal", # "horizontal", "vertical", "robotwin", or None
         override_instruction: Optional[str] = None, # whether to hardcode a specific instruction for all samples, for debugging
+        # When True, also surface tokenized text ids ("text_input_ids", "text_attention_mask")
+        # for the trimodal text expert. Requires `precompute_text_embeds.py` to have stored ids
+        # in the cache (new format). Old caches will fall back to on-the-fly tokenization.
+        return_text_tokens: bool = False,
+        text_tokenizer_path: Optional[str] = None,
+        # When True, skip the DEFAULT_PROMPT wrap and pass `sample['instruction']`
+        # through verbatim. Pair with `processor.use_reasoning_as_instruction=True`
+        # for LIBERO-CoT-style dense per-frame reasoning text.
+        use_reasoning_as_instruction: bool = False,
     ):
         self.lerobot_dataset = BaseLerobotDataset(
             dataset_dirs=dataset_dirs,
@@ -72,6 +81,10 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         self.max_padding_retry = max_padding_retry
         self.concat_multi_camera = concat_multi_camera
         self.override_instruction = override_instruction
+        self.return_text_tokens = bool(return_text_tokens)
+        self.text_tokenizer_path = text_tokenizer_path
+        self._lazy_text_tokenizer = None  # built on first miss
+        self.use_reasoning_as_instruction = bool(use_reasoning_as_instruction)
 
         self.resize_transform = ResizeSmallestSideAspectPreserving(
             args={"img_w": self.video_size[1], "img_h": self.video_size[0]},
@@ -209,17 +222,22 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             )
 
         task = sample["instruction"]
-        
+
         # FIXME
         if self.override_instruction is not None:
             task = self.override_instruction
-        instruction = DEFAULT_PROMPT.format(task=task)
+        if self.use_reasoning_as_instruction:
+            # Reasoning is self-framing (<think>...</think>); pass through verbatim
+            # without the "A video recorded from..." wrap.
+            instruction = str(task)
+        else:
+            instruction = DEFAULT_PROMPT.format(task=task)
 
-        context, context_mask = self._get_cached_text_context(instruction)
+        context, context_mask, text_input_ids, text_attention_mask = self._get_cached_text_context(instruction)
         # NOTE: to keep consistent with wan2.2's behavior
         context[~context_mask] = 0.0
         context_mask = torch.ones_like(context_mask)
-        
+
         data = {
             "video": video,
             "action": action,
@@ -231,6 +249,16 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             "action_is_pad": sample["action_is_pad"],
             "proprio_is_pad": sample["proprio_is_pad"],
         }
+        if self.return_text_tokens:
+            if text_input_ids is None:
+                raise RuntimeError(
+                    f"return_text_tokens=True but cached payload has no `ids` for instruction:\n"
+                    f"  {instruction}\nRe-run scripts/precompute_text_embeds.py to refresh the "
+                    f"cache (the new format stores ids), or set text_tokenizer_path to enable "
+                    f"on-the-fly tokenization fallback."
+                )
+            data["text_input_ids"] = text_input_ids
+            data["text_attention_mask"] = text_attention_mask
         return data
 
     def _get_cached_text_context(self, prompt: str):
@@ -265,7 +293,32 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                 f"Cached mask_len mismatch: expected {self.context_len}, got {context_mask.shape[0]} in {cache_path}"
             )
 
-        return context, context_mask
+        text_input_ids = None
+        text_attention_mask = None
+        if self.return_text_tokens:
+            cached_ids = payload.get("ids")
+            if cached_ids is not None:
+                if cached_ids.ndim != 1 or cached_ids.shape[0] != self.context_len:
+                    raise ValueError(
+                        f"Cached `ids` must be 1D [{self.context_len}], got shape "
+                        f"{tuple(cached_ids.shape)} in {cache_path}"
+                    )
+                text_input_ids = cached_ids.long()
+                text_attention_mask = context_mask.clone()
+            elif self.text_tokenizer_path is not None:
+                # Lazy fallback: tokenize the prompt on the fly so old caches still work.
+                if self._lazy_text_tokenizer is None:
+                    from fastwam.models.wan22.wan_video_text_encoder import HuggingfaceTokenizer
+                    self._lazy_text_tokenizer = HuggingfaceTokenizer(
+                        name=self.text_tokenizer_path,
+                        seq_len=self.context_len,
+                        clean="whitespace",
+                    )
+                ids, mask = self._lazy_text_tokenizer([prompt], return_mask=True, add_special_tokens=True)
+                text_input_ids = ids[0].long()
+                text_attention_mask = mask[0].bool()
+
+        return context, context_mask, text_input_ids, text_attention_mask
 
     def __getitem__(self, idx):
         try:

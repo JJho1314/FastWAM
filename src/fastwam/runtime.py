@@ -243,6 +243,208 @@ def create_fastwam_joint(
     )
 
 
+def create_fastwam_trimodal(
+    model_id: str,
+    tokenizer_model_id: str,
+    video_dit_config,
+    tokenizer_max_len: int = 128,
+    load_text_encoder: bool = False,
+    proprio_dim: int | None = None,
+    action_dit_config=None,
+    action_dit_pretrained_path: str | None = None,
+    text_dit_config=None,
+    skip_dit_load_from_pretrain: bool = False,
+    video_scheduler=None,
+    action_scheduler=None,
+    text_scheduler=None,
+    loss=None,
+    mot_checkpoint_mixed_attn: bool = True,
+    redirect_common_files: bool = True,
+    model_dtype: torch.dtype = torch.bfloat16,
+    device: str = "cuda",
+):
+    """Build a FastWAMTrimodal (video + action + text experts) on top of Wan2.2-TI2V-5B."""
+    from .models.wan22.action_dit import ActionDiT
+    from .models.wan22.fastwam_trimodal import FastWAMTrimodal
+    from .models.wan22.helpers.loader import _resolve_configs, load_wan22_ti2v_5b_components
+    from .models.wan22.mot import MoT
+    from .models.wan22.text_dit import TextDiT
+    from .models.wan22.wan_video_text_encoder import HuggingfaceTokenizer
+
+    # ---- coerce DictConfig -> dict ----
+    if isinstance(video_dit_config, DictConfig):
+        video_dit_config = OmegaConf.to_container(video_dit_config, resolve=True)
+    if not isinstance(video_dit_config, dict):
+        raise ValueError(f"`video_dit_config` must resolve to a dict, got {type(video_dit_config)}")
+
+    if isinstance(action_dit_config, DictConfig):
+        action_dit_config = OmegaConf.to_container(action_dit_config, resolve=True)
+    if action_dit_config is None:
+        action_dit_config = {}
+    if not isinstance(action_dit_config, dict):
+        raise ValueError(f"`action_dit_config` must resolve to a dict, got {type(action_dit_config)}")
+
+    if isinstance(text_dit_config, DictConfig):
+        text_dit_config = OmegaConf.to_container(text_dit_config, resolve=True)
+    if text_dit_config is None:
+        text_dit_config = {}
+    if not isinstance(text_dit_config, dict):
+        raise ValueError(f"`text_dit_config` must resolve to a dict, got {type(text_dit_config)}")
+
+    if isinstance(video_scheduler, DictConfig):
+        video_scheduler = OmegaConf.to_container(video_scheduler, resolve=True)
+    if video_scheduler is None:
+        video_scheduler = {}
+    if not isinstance(video_scheduler, dict):
+        raise ValueError(f"`video_scheduler` must be dict-like, got {type(video_scheduler)}")
+
+    if isinstance(action_scheduler, DictConfig):
+        action_scheduler = OmegaConf.to_container(action_scheduler, resolve=True)
+    if action_scheduler is None:
+        raise ValueError("`action_scheduler` is required for FastWAMTrimodal.")
+    if not isinstance(action_scheduler, dict):
+        raise ValueError(f"`action_scheduler` must be dict-like, got {type(action_scheduler)}")
+    required_action_scheduler_keys = {"train_shift", "infer_shift", "num_train_timesteps"}
+    missing_keys = required_action_scheduler_keys - set(action_scheduler.keys())
+    if missing_keys:
+        raise ValueError(f"`action_scheduler` missing required keys: {sorted(missing_keys)}.")
+
+    if isinstance(text_scheduler, DictConfig):
+        text_scheduler = OmegaConf.to_container(text_scheduler, resolve=True)
+    if text_scheduler is None:
+        text_scheduler = {}
+    if not isinstance(text_scheduler, dict):
+        raise ValueError(f"`text_scheduler` must be dict-like, got {type(text_scheduler)}")
+
+    if isinstance(loss, DictConfig):
+        loss = OmegaConf.to_container(loss, resolve=True)
+    if loss is None:
+        loss = {}
+    if not isinstance(loss, dict):
+        raise ValueError(f"`loss` must be dict-like, got {type(loss)}")
+
+    # ---- video + vae + (optional) text encoder ----
+    components = load_wan22_ti2v_5b_components(
+        device=device,
+        torch_dtype=model_dtype,
+        model_id=model_id,
+        tokenizer_model_id=tokenizer_model_id,
+        tokenizer_max_len=tokenizer_max_len,
+        redirect_common_files=redirect_common_files,
+        dit_config=video_dit_config,
+        skip_dit_load_from_pretrain=skip_dit_load_from_pretrain,
+        load_text_encoder=load_text_encoder,
+    )
+    tokenizer = components.tokenizer
+    if tokenizer is None:
+        # Load tokenizer only (no T5 weights) for vocab_size and runtime encoding fallback.
+        _, _, _, tok_cfg = _resolve_configs(
+            model_id=model_id,
+            tokenizer_model_id=tokenizer_model_id,
+            redirect_common_files=redirect_common_files,
+        )
+        tok_cfg.download_if_necessary()
+        tokenizer = HuggingfaceTokenizer(
+            name=tok_cfg.path,
+            seq_len=int(tokenizer_max_len),
+            clean="whitespace",
+        )
+    vocab_size = int(tokenizer.vocab_size)
+
+    # ---- action expert ----
+    action_expert = ActionDiT.from_pretrained(
+        action_dit_config=action_dit_config,
+        action_dit_pretrained_path=action_dit_pretrained_path,
+        skip_dit_load_from_pretrain=skip_dit_load_from_pretrain,
+        device=device,
+        torch_dtype=model_dtype,
+    )
+
+    # ---- text expert ----
+    # Inherit shared structural dims from video_dit_config so MoT mixed attention aligns.
+    text_dit_cfg = dict(text_dit_config)
+    text_dit_cfg.setdefault("hidden_dim", int(action_dit_config.get("hidden_dim", 1024)))
+    text_dit_cfg.setdefault("ffn_dim", int(action_dit_config.get("ffn_dim", 4096)))
+    text_dit_cfg.setdefault("text_dim", int(video_dit_config["text_dim"]))
+    text_dit_cfg.setdefault("freq_dim", int(video_dit_config["freq_dim"]))
+    text_dit_cfg.setdefault("eps", float(video_dit_config["eps"]))
+    text_dit_cfg["num_heads"] = int(video_dit_config["num_heads"])
+    text_dit_cfg["attn_head_dim"] = int(video_dit_config["attn_head_dim"])
+    text_dit_cfg["num_layers"] = int(video_dit_config["num_layers"])
+    text_dit_cfg.setdefault("max_seq_len", int(tokenizer_max_len))
+    text_dit_cfg["vocab_size"] = vocab_size
+    text_dit_cfg.setdefault("use_gradient_checkpointing", bool(mot_checkpoint_mixed_attn))
+
+    text_expert = TextDiT(**text_dit_cfg).to(device=device, dtype=model_dtype)
+
+    # ---- consistency checks ----
+    video_expert = components.dit
+    for expert_name, expert in [("action", action_expert), ("text", text_expert)]:
+        if int(expert.num_heads) != int(video_expert.num_heads):
+            raise ValueError(
+                f"{expert_name}_expert `num_heads`={expert.num_heads} must match video expert "
+                f"`num_heads`={video_expert.num_heads}"
+            )
+        if int(expert.attn_head_dim) != int(video_expert.attn_head_dim):
+            raise ValueError(
+                f"{expert_name}_expert `attn_head_dim`={expert.attn_head_dim} must match video "
+                f"expert `attn_head_dim`={video_expert.attn_head_dim}"
+            )
+        if int(len(expert.blocks)) != int(len(video_expert.blocks)):
+            raise ValueError(
+                f"{expert_name}_expert num_layers={len(expert.blocks)} must match video expert "
+                f"num_layers={len(video_expert.blocks)}"
+            )
+
+    # ---- MoT ----
+    mot = MoT(
+        mixtures={"video": video_expert, "action": action_expert, "text": text_expert},
+        mot_checkpoint_mixed_attn=bool(mot_checkpoint_mixed_attn),
+    )
+
+    # ---- top-level model ----
+    model = FastWAMTrimodal(
+        video_expert=video_expert,
+        action_expert=action_expert,
+        text_expert=text_expert,
+        mot=mot,
+        vae=components.vae,
+        text_encoder=components.text_encoder,
+        tokenizer=tokenizer,
+        text_dim=int(video_dit_config["text_dim"]),
+        proprio_dim=(None if proprio_dim is None else int(proprio_dim)),
+        device=device,
+        torch_dtype=model_dtype,
+        video_train_shift=float(video_scheduler.get("train_shift", 5.0)),
+        video_infer_shift=float(video_scheduler.get("infer_shift", 5.0)),
+        video_num_train_timesteps=int(video_scheduler.get("num_train_timesteps", 1000)),
+        action_train_shift=float(action_scheduler["train_shift"]),
+        action_infer_shift=float(action_scheduler["infer_shift"]),
+        action_num_train_timesteps=int(action_scheduler["num_train_timesteps"]),
+        text_train_shift=float(text_scheduler.get("train_shift", 1.0)),
+        text_num_train_timesteps=int(text_scheduler.get("num_train_timesteps", 1000)),
+        text_mask_token_id=(None if text_scheduler.get("mask_token_id") is None
+                            else int(text_scheduler["mask_token_id"])),
+        loss_lambda_video=float(loss.get("lambda_video", 1.0)),
+        loss_lambda_action=float(loss.get("lambda_action", 1.0)),
+        loss_lambda_text=float(loss.get("lambda_text", 0.1)),
+        text_clean_prob=float(loss.get("text_clean_prob", 0.4)),
+        text_recall_prob=float(loss.get("text_recall_prob", 0.4)),
+        text_joint_prob=float(loss.get("text_joint_prob", 0.2)),
+    )
+    model.model_paths = {
+        "video_dit": components.dit_path,
+        "vae": components.vae_path,
+        "text_encoder": components.text_encoder_path,
+        "tokenizer": components.tokenizer_path,
+        "action_dit_backbone": (
+            "SKIPPED_PRETRAIN" if skip_dit_load_from_pretrain else action_dit_pretrained_path
+        ),
+        "text_dit_backbone": "RANDOM_INIT",
+    }
+    return model
+
+
 def create_fastwam_idm(
     model_id: str,
     tokenizer_model_id: str,

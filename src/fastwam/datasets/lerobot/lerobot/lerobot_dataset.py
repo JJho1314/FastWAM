@@ -1254,8 +1254,9 @@ class MultiLeRobotDataset(torch.utils.data.Dataset):
                             message="The given NumPy array is not writable",
                             category=UserWarning,
                         )
-                        # deal with string in parquet file
-                        if np_arr.dtype == 'O':                        
+                        # deal with string in parquet file (object dtype 'O',
+                        # fixed-width unicode 'U', or fixed-width bytes 'S')
+                        if np_arr.dtype.kind in ("O", "U", "S"):
                             result_dict[col_name] = np_arr
                         else:
                             result_dict[col_name] = torch.from_numpy(np_arr)

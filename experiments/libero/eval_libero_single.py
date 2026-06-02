@@ -1,9 +1,11 @@
 import json
+import hashlib
 import inspect
 import logging
 import os
 import sys
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Optional
 
@@ -117,6 +119,21 @@ def _resolve_dataset_stats_path(cfg: DictConfig) -> Path:
 def _load_model_checkpoint(model: torch.nn.Module, ckpt: str) -> None:
     model.load_checkpoint(ckpt)
     logging.info("Loaded checkpoint via model.load_checkpoint: %s", ckpt)
+
+
+@contextmanager
+def _libero_torch_load_compat():
+    original_load = torch.load
+
+    def _load_with_legacy_default(*args, **kwargs):
+        kwargs.setdefault("weights_only", False)
+        return original_load(*args, **kwargs)
+
+    torch.load = _load_with_legacy_default
+    try:
+        yield
+    finally:
+        torch.load = original_load
     return
 
     # deprecated legacy checkpoint loading
@@ -204,6 +221,7 @@ def _obs_to_model_input(
             raise ValueError(f"shape_meta.images[{camera_idx}].shape must be [C,H,W], got {shape}")
         return int(shape[1]), int(shape[2])
 
+    preserve_multi_camera = bool(cfg.data.train.get("preserve_multi_camera_video", False))
     concatenation = cfg.data.train.get("concat_multi_camera", "horizontal")
     num_cameras = processor.num_output_cameras
     if num_cameras == 1:
@@ -214,7 +232,14 @@ def _obs_to_model_input(
         wrist_h, wrist_w = _meta_to_hw(image_meta[1], camera_idx=1)
         primary = _center_crop_resize(imgs["image"], width=primary_w, height=primary_h)
         wrist = _center_crop_resize(imgs["wrist_image"], width=wrist_w, height=wrist_h)
-        if concatenation == "horizontal":
+        if preserve_multi_camera:
+            if (primary_h, primary_w) != (wrist_h, wrist_w):
+                raise ValueError(
+                    "preserve_multi_camera_video=True requires identical per-camera eval shapes, "
+                    f"got primary={(primary_h, primary_w)} wrist={(wrist_h, wrist_w)}."
+                )
+            rgb = np.stack([primary, wrist], axis=0)
+        elif concatenation == "horizontal":
             rgb = np.concatenate([primary, wrist], axis=1)
         elif concatenation == "vertical":
             rgb = np.concatenate([primary, wrist], axis=0)
@@ -223,17 +248,25 @@ def _obs_to_model_input(
     else:
         raise ValueError(f"LIBERO eval currently supports num_output_cameras in [1, 2], got {num_cameras}.")
 
-    actual_h, actual_w = int(rgb.shape[0]), int(rgb.shape[1])
     expected_h, expected_w = int(height), int(width)
     image_shapes = [meta["shape"] for meta in image_meta]
-    assert actual_h == expected_h and actual_w == expected_w, (
-        "Input image size mismatch after per-camera resize + concat: "
-        f"got (H,W)=({actual_h},{actual_w}), expected (H,W)=({expected_h},{expected_w}) "
-        f"from data.train.video_size={[expected_h, expected_w]}; "
-        f"shape_meta.images={image_shapes}, concat_multi_camera={concatenation}."
-    )
-
-    x = torch.tensor(rgb).permute(2, 0, 1).unsqueeze(0).to(device=device, dtype=dtype)
+    if preserve_multi_camera and num_cameras > 1:
+        actual_h, actual_w = int(rgb.shape[1]), int(rgb.shape[2])
+        assert actual_h == expected_h and actual_w == expected_w, (
+            "Input image size mismatch after per-camera resize: "
+            f"got per-camera (H,W)=({actual_h},{actual_w}), expected (H,W)=({expected_h},{expected_w}) "
+            f"from data.train.video_size={[expected_h, expected_w]}; shape_meta.images={image_shapes}."
+        )
+        x = torch.tensor(rgb).permute(0, 3, 1, 2).unsqueeze(0).to(device=device, dtype=dtype)
+    else:
+        actual_h, actual_w = int(rgb.shape[0]), int(rgb.shape[1])
+        assert actual_h == expected_h and actual_w == expected_w, (
+            "Input image size mismatch after per-camera resize + concat: "
+            f"got (H,W)=({actual_h},{actual_w}), expected (H,W)=({expected_h},{expected_w}) "
+            f"from data.train.video_size={[expected_h, expected_w]}; "
+            f"shape_meta.images={image_shapes}, concat_multi_camera={concatenation}."
+        )
+        x = torch.tensor(rgb).permute(2, 0, 1).unsqueeze(0).to(device=device, dtype=dtype)
     x = x * (2.0 / 255.0) - 1.0
 
     proprio = _normalize_proprio(_extract_sim_state(obs), processor)
@@ -275,6 +308,51 @@ def _denormalize_action(action: torch.Tensor, processor: FastWAMProcessor) -> np
     return denorm.numpy()
 
 
+def _postprocess_gripper_action(action: np.ndarray, cfg: DictConfig) -> np.ndarray:
+    """Convert denormalized dataset gripper values to LIBERO env convention."""
+    mode = str(cfg.EVALUATION.get("gripper_action_mode", "rlds_01")).lower()
+    if mode in {"rlds_01", "rlds", "01", "zero_one"}:
+        # RLDS-style loaders use 0 = close, 1 = open. LIBERO env uses
+        # -1 = open, +1 = close, so map to [-1, 1] and flip sign.
+        action[..., -1] = action[..., -1] * 2 - 1
+        action = invert_gripper_action(action)
+    elif mode in {"libero_pm1", "pm1", "minus_one_plus_one"}:
+        # Dataset already matches LIBERO env convention.
+        pass
+    else:
+        raise ValueError(
+            f"Unsupported EVALUATION.gripper_action_mode={mode!r}. "
+            "Expected 'rlds_01' or 'libero_pm1'."
+        )
+
+    if bool(cfg.EVALUATION.get("binarize_gripper", False)):
+        action[..., -1] = np.sign(action[..., -1])
+    return action
+
+
+def _load_cached_text_context(prompt: str, cfg: DictConfig, *, device: str, dtype: torch.dtype):
+    cache_dir_cfg = cfg.data.train.get("text_embedding_cache_dir", None)
+    if cache_dir_cfg is None:
+        raise ValueError("Cached text context requested but data.train.text_embedding_cache_dir is not set.")
+    cache_dir = Path(os.path.expanduser(os.path.expandvars(str(cache_dir_cfg))))
+    context_len = int(cfg.data.train.get("context_len", 128))
+    hashed = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+    cache_path = cache_dir / f"{hashed}.t5_len{context_len}.wan22ti2v5b.pt"
+    if not cache_path.exists():
+        raise FileNotFoundError(
+            f"Missing cached text context: {cache_path}. "
+            "Run scripts/precompute_text_embeds.py or enable model.load_text_encoder=true."
+        )
+    payload = torch.load(str(cache_path), map_location="cpu")
+    context = payload["context"]
+    context_mask = payload["mask"].bool()
+    if context.ndim != 2 or context.shape[0] != context_len:
+        raise ValueError(f"Invalid cached context shape {tuple(context.shape)} in {cache_path}")
+    if context_mask.ndim != 1 or context_mask.shape[0] != context_len:
+        raise ValueError(f"Invalid cached context mask shape {tuple(context_mask.shape)} in {cache_path}")
+    return context.to(device=device, dtype=dtype), context_mask.to(device=device, dtype=torch.bool)
+
+
 def _get_num_video_frames(cfg: DictConfig) -> int:
     return (int(cfg.data.train.num_frames) - 1) // int(cfg.data.train.action_video_freq_ratio) + 1
 
@@ -295,15 +373,95 @@ def _select_predicted_future_frames(pred_video: list[Image.Image], cfg: DictConf
     if len(pred_video) == 0:
         raise ValueError("`infer_joint` returned an empty predicted video.")
 
-    replan_steps = int(cfg.EVALUATION.get("replan_steps", 5))
+    replan_steps = int(cfg.EVALUATION.get("replan_steps", 10))
     action_video_freq_ratio = int(cfg.data.train.action_video_freq_ratio)
     num_future_frames = replan_steps // action_video_freq_ratio
     keep_frames = 1 + num_future_frames
     return list(pred_video[:keep_frames])
 
 
+def _tensor_video_to_pil_frames(video: torch.Tensor) -> list[Image.Image]:
+    """Convert stitched RGB video `[1,3,T,H,W]` or `[3,T,H,W]` in [0,1] to PIL frames."""
+    if video.ndim == 5:
+        if video.shape[0] != 1:
+            raise ValueError(f"Expected batch size 1 for decoded feature video, got {tuple(video.shape)}")
+        video = video[0]
+    if video.ndim != 4 or video.shape[0] != 3:
+        raise ValueError(f"Expected decoded feature video [3,T,H,W], got {tuple(video.shape)}")
+
+    frames = []
+    video = video.detach().to(device="cpu", dtype=torch.float32).clamp(0.0, 1.0)
+    for frame_idx in range(video.shape[1]):
+        arr = (video[:, frame_idx].permute(1, 2, 0).numpy() * 255.0).round().astype(np.uint8)
+        frames.append(Image.fromarray(arr))
+    return frames
+
+
+def _decode_feature_future_frames(
+    model: torch.nn.Module,
+    features: torch.Tensor,
+    *,
+    processor: FastWAMProcessor,
+) -> list[Image.Image]:
+    feature_encoder = getattr(model, "feature_encoder", None)
+    decode_features = getattr(feature_encoder, "decode_features", None)
+    if not callable(decode_features):
+        raise ValueError("Feature future-video visualization requires `model.feature_encoder.decode_features`.")
+    num_views = int(processor.num_output_cameras)
+    decoded = decode_features(features, num_views=num_views)
+    return _tensor_video_to_pil_frames(decoded)
+
+
+def _build_feature_rollout_sample(
+    *,
+    image: torch.Tensor,
+    action_horizon: int,
+    num_video_frames: int,
+    processor: FastWAMProcessor,
+    proprio: torch.Tensor,
+    context: torch.Tensor,
+    context_mask: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    if image.ndim == 4:
+        video = image.unsqueeze(2).repeat(1, 1, num_video_frames, 1, 1)
+    elif image.ndim == 5:
+        video = image.unsqueeze(2).repeat(1, 1, num_video_frames, 1, 1, 1)
+    else:
+        raise ValueError(f"Expected online eval image [B,3,H,W] or [B,V,3,H,W], got {tuple(image.shape)}")
+
+    if context.ndim == 2:
+        context = context.unsqueeze(0)
+    if context_mask.ndim == 1:
+        context_mask = context_mask.unsqueeze(0)
+    if context.ndim != 3 or context_mask.ndim != 2:
+        raise ValueError(
+            f"Expected context/context_mask [B,L,D]/[B,L], got {tuple(context.shape)} and {tuple(context_mask.shape)}"
+        )
+
+    if proprio.ndim == 1:
+        proprio_btd = proprio.view(1, 1, -1)
+    elif proprio.ndim == 2 and proprio.shape[0] == 1:
+        proprio_btd = proprio.unsqueeze(1)
+    elif proprio.ndim == 3 and proprio.shape[0] == 1:
+        proprio_btd = proprio
+    else:
+        raise ValueError(f"Expected proprio [D], [1,D], or [1,T,D], got {tuple(proprio.shape)}")
+
+    action_dim = int(processor.action_output_dim)
+    action = torch.zeros((1, action_horizon, action_dim), device=image.device, dtype=image.dtype)
+    return {
+        "video": video,
+        "action": action,
+        "proprio": proprio_btd.to(device=image.device, dtype=image.dtype),
+        "context": context.to(device=image.device, dtype=image.dtype),
+        "context_mask": context_mask.to(device=image.device, dtype=torch.bool),
+        "action_is_pad": torch.zeros((1, action_horizon), device=image.device, dtype=torch.bool),
+        "image_is_pad": torch.zeros((1, num_video_frames), device=image.device, dtype=torch.bool),
+    }
+
+
 def _get_future_frame_capture_steps(cfg: DictConfig) -> list[int]:
-    replan_steps = int(cfg.EVALUATION.get("replan_steps", 5))
+    replan_steps = int(cfg.EVALUATION.get("replan_steps", 10))
     action_video_freq_ratio = int(cfg.data.train.action_video_freq_ratio)
     num_future_frames = replan_steps // action_video_freq_ratio
     return [step_idx * action_video_freq_ratio for step_idx in range(num_future_frames + 1)]
@@ -386,8 +544,22 @@ def _predict_action_chunk(
         dtype=model.torch_dtype,
     )
 
+    use_cached_text_context = bool(cfg.EVALUATION.get("use_cached_text_context", False))
+    if use_cached_text_context:
+        context, context_mask = _load_cached_text_context(
+            prompt,
+            cfg,
+            device=model_device,
+            dtype=model.torch_dtype,
+        )
+        prompt_for_model = None
+    else:
+        context = None
+        context_mask = None
+        prompt_for_model = prompt
+
     infer_kwargs = {
-        "prompt": prompt,
+        "prompt": prompt_for_model,
         "input_image": image,
         "action_horizon": action_horizon,
         "negative_prompt": str(cfg.EVALUATION.get("negative_prompt", "")),
@@ -403,29 +575,62 @@ def _predict_action_chunk(
         "rand_device": str(cfg.EVALUATION.get("rand_device", "cpu")),
         "tiled": bool(cfg.EVALUATION.get("tiled", False)),
     }
+    if context is not None:
+        infer_kwargs["context"] = context
+        infer_kwargs["context_mask"] = context_mask
     visualize_future_video = bool(cfg.EVALUATION.get("visualize_future_video", False))
     predicted_future_frames = None
-    if visualize_future_video:
-        infer_kwargs["num_video_frames"] = _get_num_video_frames(cfg)
-    elif "num_video_frames" in inspect.signature(model.infer_action).parameters:
-        infer_kwargs["num_video_frames"] = _get_num_video_frames(cfg)
-
-    with torch.no_grad():
+    num_video_frames = _get_num_video_frames(cfg)
+    feature_decode_available = (
+        callable(getattr(model, "infer_features", None))
+        and callable(getattr(getattr(model, "feature_encoder", None), "decode_features", None))
+    )
+    if visualize_future_video and feature_decode_available:
+        if context is None:
+            context, context_mask = model.encode_prompt(prompt)
+        feature_sample = _build_feature_rollout_sample(
+            image=image,
+            action_horizon=action_horizon,
+            num_video_frames=num_video_frames,
+            processor=processor,
+            proprio=proprio,
+            context=context,
+            context_mask=context_mask,
+        )
+        with torch.no_grad():
+            pred = model.infer_features(
+                feature_sample,
+                num_inference_steps=num_inference_steps,
+                seed=42 if cfg.get("seed") is None else int(cfg.seed),
+                rand_device=str(cfg.EVALUATION.get("rand_device", "cpu")),
+            )
+        action = pred["action"]
+        predicted_future_frames = _select_predicted_future_frames(
+            _decode_feature_future_frames(model, pred["features"], processor=processor),
+            cfg,
+        )
+    else:
         if visualize_future_video:
-            pred = model.infer_joint(**infer_kwargs)
-            predicted_future_frames = _select_predicted_future_frames(pred["video"], cfg)
-        else:
-            pred = model.infer_action(**infer_kwargs)
-    action = pred["action"]  # [T, D]
+            if hasattr(model, "infer_joint"):
+                infer_kwargs["num_video_frames"] = num_video_frames
+            else:
+                logging.warning(
+                    "EVALUATION.visualize_future_video=true was requested, but model has neither "
+                    "`infer_features()+decode_features()` nor `infer_joint()`. Falling back to action-only eval."
+                )
+        elif "num_video_frames" in inspect.signature(model.infer_action).parameters:
+            infer_kwargs["num_video_frames"] = num_video_frames
+
+        with torch.no_grad():
+            if visualize_future_video and "num_video_frames" in infer_kwargs and hasattr(model, "infer_joint"):
+                pred = model.infer_joint(**infer_kwargs)
+                predicted_future_frames = _select_predicted_future_frames(pred["video"], cfg)
+            else:
+                pred = model.infer_action(**infer_kwargs)
+        action = pred["action"]  # [T, D]
 
     action = _denormalize_action(action, processor)[0]  # [T, D]
-
-    # The dataloader flips the sign of the gripper action to align with other datasets
-    # (0 = close, 1 = open), so flip it back (-1 = open, +1 = close) before executing the action
-    action[..., -1] = action[..., -1] * 2 - 1
-    action = invert_gripper_action(action)
-    if bool(cfg.EVALUATION.get("binarize_gripper", False)):
-        action[..., -1] = np.sign(action[..., -1])
+    action = _postprocess_gripper_action(action, cfg)
     return action, imgs, predicted_future_frames
 
 
@@ -457,7 +662,7 @@ def run_single_episode(
     model_device: str,
 ) -> tuple[bool, list, list[dict[str, Any]], Optional[float]]:
     max_steps = _get_max_steps(cfg.EVALUATION.task_suite_name)
-    replan_steps = int(cfg.EVALUATION.get("replan_steps", 5))
+    replan_steps = int(cfg.EVALUATION.get("replan_steps", 10))
     num_steps_wait = int(cfg.EVALUATION.get("num_steps_wait", 5))
     use_action_ensembler = bool(cfg.EVALUATION.get("use_action_ensembler", False))
     visualize_future_video = bool(cfg.EVALUATION.get("visualize_future_video", False))
@@ -734,7 +939,8 @@ def eval_single_process(cfg: DictConfig):
     benchmark_dict = benchmark.get_benchmark_dict()
     task_suite = benchmark_dict[cfg.EVALUATION.task_suite_name]()
     task = task_suite.get_task(cfg.EVALUATION.task_id)
-    initial_states = task_suite.get_task_init_states(cfg.EVALUATION.task_id)
+    with _libero_torch_load_compat():
+        initial_states = task_suite.get_task_init_states(cfg.EVALUATION.task_id)
 
     while len(initial_states) < int(cfg.EVALUATION.num_trials):
         initial_states.extend(initial_states[: (int(cfg.EVALUATION.num_trials) - len(initial_states))])

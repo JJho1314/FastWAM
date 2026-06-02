@@ -145,6 +145,49 @@ def _read_unique_prompts(dataset_dirs: list[str]) -> list[str]:
     return prompts
 
 
+def _read_unique_reasoning_prompts(dataset_dirs: list[str]) -> list[str]:
+    """Scan parquet files for unique `reasoning` strings (LIBERO-CoT style).
+
+    These are passed verbatim to the text encoder (no DEFAULT_PROMPT wrap),
+    matching what `RobotVideoDataset.use_reasoning_as_instruction=True` feeds
+    into `_get_cached_text_context` at training time.
+    """
+    import pandas as pd
+
+    prompts: list[str] = []
+    seen: set[str] = set()
+    total_rows = 0
+    for ds_dir in dataset_dirs:
+        ds_path = Path(ds_dir)
+        data_dir = ds_path / "data"
+        if not data_dir.exists():
+            raise FileNotFoundError(f"Missing data dir: {data_dir}")
+        parquet_files = sorted(data_dir.rglob("episode_*.parquet"))
+        if not parquet_files:
+            raise FileNotFoundError(f"No episode_*.parquet under {data_dir}")
+        logger.info("Scanning %d parquet files in %s for `reasoning` strings.", len(parquet_files), ds_dir)
+        for fp in parquet_files:
+            df = pd.read_parquet(fp, columns=["reasoning"])
+            total_rows += len(df)
+            # Use the order of first appearance so the resulting prompt list is
+            # deterministic across runs (handy for resumable precompute).
+            for value in df["reasoning"].tolist():
+                if value is None:
+                    continue
+                s = str(value).strip()
+                if not s or s in seen:
+                    continue
+                seen.add(s)
+                prompts.append(s)
+    logger.info(
+        "Scanned %d total reasoning rows from %d datasets, deduplicated to %d unique reasoning prompts.",
+        total_rows,
+        len(dataset_dirs),
+        len(prompts),
+    )
+    return prompts
+
+
 def _get_override_prompt(override_instruction: Any) -> str | None:
     if override_instruction is None:
         return None
@@ -193,13 +236,23 @@ def main(cfg: DictConfig):
 
     context_len = _resolve_context_len(context_lens)
     override_prompt = _get_override_prompt(cfg.get("override_instruction"))
+    # Detect LIBERO-CoT mode: scan parquet `reasoning` instead of tasks.jsonl.
+    # The flag can be set at the top-level cfg (CLI override) or under cfg.data
+    # (the natural location when grouped with the data config).
+    use_reasoning_prompts = bool(cfg.get("use_reasoning_prompts", False))
+    if not use_reasoning_prompts and cfg.get("data") is not None:
+        use_reasoning_prompts = bool(cfg.data.get("use_reasoning_prompts", False))
     if override_prompt is not None:
         prompts = [override_prompt]
         logger.info("Using override_instruction; skipping dataset scan and encoding exactly 1 prompt.")
     else:
         if not dataset_dirs:
             raise ValueError("No `dataset_dirs` found under `cfg.data`.")
-        prompts = _read_unique_prompts(dataset_dirs)
+        if use_reasoning_prompts:
+            logger.info("`use_reasoning_prompts=true` => extracting unique reasoning strings from parquet.")
+            prompts = _read_unique_reasoning_prompts(dataset_dirs)
+        else:
+            prompts = _read_unique_prompts(dataset_dirs)
     if not prompts:
         logger.warning("No prompts found from tasks.jsonl; nothing to do.")
         return
@@ -318,9 +371,14 @@ def main(cfg: DictConfig):
                     hashed = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
                     context_i = context[i].detach().to(device="cpu", dtype=torch.bfloat16).contiguous()
                     mask_i = mask[i].detach().to(device="cpu", dtype=torch.bool).contiguous()
+                    ids_i = ids[i].detach().to(device="cpu", dtype=torch.long).contiguous()
                     payload = {
                         "context": context_i,
                         "mask": mask_i,
+                        # Token ids stored alongside the T5 hidden states so the
+                        # trimodal text expert can use them as ground truth for
+                        # the discrete-flow CE loss.
+                        "ids": ids_i,
                     }
 
                     for cache_dir in cache_dirs:
