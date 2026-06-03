@@ -129,6 +129,11 @@ class SanaActionExpert(nn.Module):
         self.t_embed = nn.Sequential(
             nn.Linear(hidden_size, hidden_size), nn.SiLU(), nn.Linear(hidden_size, hidden_size)
         )
+        # The SANA video DiT's raw block features can have very large magnitude
+        # (~1e5); normalize before projecting so the cross-attention memory is
+        # unit-scale and gradients back into the video DiT stay bounded (avoids
+        # bf16 gradient overflow / NaN when the video expert is trainable).
+        self.video_norm = nn.LayerNorm(video_feat_dim)
         self.video_proj = nn.Linear(video_feat_dim, hidden_size)
         self.text_proj = nn.Linear(text_dim, hidden_size)
         self.blocks = nn.ModuleList(
@@ -156,7 +161,7 @@ class SanaActionExpert(nn.Module):
             raise ValueError(f"action chunk len {T} exceeds max_action_len {self.pos_embed.shape[1]}")
         x = self.action_in(noisy_action) + self.pos_embed[:, :T]
         t_emb = self.t_embed(timestep_embedding(timestep, self.hidden_size).to(x.dtype))
-        vid = self.video_proj(video_feats.to(x.dtype))
+        vid = self.video_proj(self.video_norm(video_feats.to(x.dtype)))
         txt = self.text_proj(text_context.to(x.dtype))
         for blk in self.blocks:
             x = blk(x, t_emb, vid, txt, text_mask)

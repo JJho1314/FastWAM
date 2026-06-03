@@ -449,6 +449,7 @@ def create_fastwam_sana(
     train_video_expert: bool = True,
     detach_video_feats: bool = False,
     grad_checkpointing: bool = True,
+    fp32_attention: bool = True,
     video_scheduler=None,
     action_scheduler=None,
     loss=None,
@@ -518,6 +519,17 @@ def create_fastwam_sana(
             logger.info("Enabled SANA-Video gradient checkpointing.")
         except Exception as e:  # noqa: BLE001
             logger.warning("Could not enable SANA grad checkpointing: %s", e)
+
+    if fp32_attention:
+        # SANA's LiteLA linear attention is numerically unstable in bf16 (NaN);
+        # SANA itself trains with fp32 attention. Match that.
+        try:
+            from diffusion.model.utils import set_fp32_attention
+
+            set_fp32_attention(dit)
+            logger.info("Enabled SANA-Video fp32 attention for stability.")
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Could not enable SANA fp32 attention: %s", e)
 
     video_expert = SanaVideoExpert(dit, feature_layer=int(feature_layer))
 

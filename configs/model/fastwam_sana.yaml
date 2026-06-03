@@ -10,6 +10,7 @@ feature_layer: -1
 train_video_expert: true
 detach_video_feats: false
 grad_checkpointing: true
+fp32_attention: true   # SANA LiteLA linear attn is unstable in bf16 -> NaN; run attn in fp32
 
 video_dit:
   model_name: SanaMSVideo_2000M_P2_D20

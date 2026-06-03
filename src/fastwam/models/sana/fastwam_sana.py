@@ -18,6 +18,7 @@ trainable parameters, an optional `proprio_encoder`, and
 
 from __future__ import annotations
 
+import os
 from typing import Callable, Optional
 
 import torch
@@ -215,6 +216,17 @@ class FastWAMSana(nn.Module):
             action_context_mask = torch.cat([context_mask, ones], dim=1)
 
         pred_a = self.action_expert(noisy_a, t_a, vf, action_context, action_context_mask)
+
+        if os.environ.get("FASTWAM_SANA_DEBUG_NAN"):
+            def _stat(name, t):
+                tf = t.float()
+                finite = torch.isfinite(tf).all().item()
+                print(f"[NAN-DEBUG] {name}: finite={finite} min={tf.amin().item():.3e} "
+                      f"max={tf.amax().item():.3e} absmax={tf.abs().amax().item():.3e}", flush=True)
+            for nm, t in [("latents", latents), ("context", context), ("video_feats", video_feats),
+                          ("pred_v", pred_v), ("target_v", target_v), ("noisy_a", noisy_a),
+                          ("pred_a", pred_a)]:
+                _stat(nm, t)
 
         a_loss_token = F.mse_loss(pred_a.float(), target_a.float(), reduction="none").mean(dim=2)
         if action_is_pad is not None:

@@ -38,10 +38,17 @@ NPROC=$(nvidia-smi -L | wc -l)
 echo "[sbatch] node=$(hostname) gpus=$NPROC env=fastwam_sana wandb=${WANDB_BASE_URL}"
 nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader || true
 
+# HPC3 absolute paths as overrides so they're robust to config edits/rsync.
+SANA_REPO=/data/user/jhe724/workspace/Sana
+SANA_W=/data/user/jhe724/weights/SANA-Video_2B_480p
+
 accelerate launch \
   --config_file scripts/accelerate_configs/accelerate_zero2_sana.yaml \
   --num_processes "$NPROC" \
   scripts/train.py task=libero_sana_2cam224_1e-4 \
+  "model.sana_repo_path=${SANA_REPO}" \
+  "model.video_dit_pretrained_path=${SANA_W}/checkpoints/SANA_Video_2B_480p.pth" \
+  "model.vae.vae_pth=${SANA_W}/vae/Wan2.1_VAE.pth" \
   wandb.enabled=true wandb.mode=online \
   "wandb.workspace=${WANDB_ENTITY_}" "wandb.project=${WANDB_PROJECT_}" "wandb.name=${WANDB_NAME_}" \
   ${EXTRA:-}
