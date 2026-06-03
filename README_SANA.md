@@ -175,6 +175,26 @@ Loaded SANA-Video weights ... (loaded=417, ..., shape_skipped=['pos_embed'])
 prior loaded correctly. `pos_embed` (the unused sincos table; this model uses
 RoPE) is skipped on load by design.
 
+## 5b. Multi-GPU on HPC3 (SLURM, 8×H100) + intranet wandb
+
+`scripts/sana_libero_8gpu.sbatch` requests one node with 8 GPUs (partition
+`acd_u`, ZeRO-2) and logs to the **on-prem wandb** at `http://10.12.1.245:8080`
+(entity `jjho1314`, project `fastwam-sana-libero`; auth via `~/.netrc`). Weight
+/ Sana paths are passed as hydra overrides in the sbatch so they survive config
+edits.
+
+```bash
+cd /data/user/jhe724/workspace/FastWAM_sana
+# trial:
+EXTRA="max_steps=40 num_workers=8" sbatch scripts/sana_libero_8gpu.sbatch
+# full run (eval disabled — no infer method yet; checkpoints every 2000 steps):
+EXTRA="batch_size=2 eval_every=999999999 save_every=2000 num_workers=8" \
+  sbatch scripts/sana_libero_8gpu.sbatch
+```
+
+Verified: loads the pretrained 2B weights, trains stably on 8×H100
+(loss_video ~0.2–0.3, no NaN), and streams to the intranet wandb run.
+
 ## 6. Configuration notes & stability
 
 - **Learning rate / NaN.** Under DeepSpeed, `accelerate.clip_grad_norm_` is a
