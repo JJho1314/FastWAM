@@ -122,6 +122,7 @@ class SanaActionExpert(nn.Module):
     ):
         super().__init__()
         self.hidden_size = hidden_size
+        self.action_dim = action_dim
         self.action_in = nn.Linear(action_dim, hidden_size)
         self.pos_embed = nn.Parameter(torch.zeros(1, max_action_len, hidden_size))
         nn.init.trunc_normal_(self.pos_embed, std=0.02)

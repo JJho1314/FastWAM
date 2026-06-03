@@ -47,6 +47,7 @@ class FastWAMSana(nn.Module):
         torch_dtype: torch.dtype = torch.float32,
         train_video_expert: bool = True,
         detach_video_feats: bool = False,
+        video_temporal_downsample: int = 4,
         video_train_shift: float = 5.0,
         video_num_train_timesteps: int = 1000,
         action_train_shift: float = 5.0,
@@ -64,6 +65,7 @@ class FastWAMSana(nn.Module):
         self.device = device
         self.torch_dtype = torch_dtype
         self.detach_video_feats = bool(detach_video_feats)
+        self.video_temporal_downsample = int(video_temporal_downsample)
         self.loss_lambda_video = float(loss_lambda_video)
         self.loss_lambda_action = float(loss_lambda_action)
 
@@ -93,17 +95,25 @@ class FastWAMSana(nn.Module):
             raise RuntimeError("`vae_encode_fn` was not provided to FastWAMSana.")
         return self._vae_encode_fn(self.vae_name, self.vae, video, device=self.device)
 
-    def _append_proprio_to_context(self, context, context_mask, proprio):
-        # proprio: (B, proprio_dim) -> one extra valid context token
-        proprio_token = self.proprio_encoder(
-            proprio.to(device=self.device, dtype=context.dtype)
-        ).unsqueeze(1)  # (B, 1, D)
-        context = torch.cat([context, proprio_token.to(context.dtype)], dim=1)
-        extra = torch.ones(
-            (context_mask.shape[0], 1), device=context_mask.device, dtype=context_mask.dtype
-        )
-        context_mask = torch.cat([context_mask, extra], dim=1)
-        return context, context_mask
+    def _video_loss_per_sample(self, pred_v, target_v, image_is_pad):
+        """Per-sample video flow loss, masking padded frames out (mirrors the
+        Wan22 path's `_compute_video_loss_per_sample`). `pred_v/target_v` are
+        (B, C, F, H, W); `image_is_pad` is (B, T) at pixel-frame resolution."""
+        loss_tok = F.mse_loss(pred_v.float(), target_v.float(), reduction="none").mean(dim=(1, 3, 4))  # (B, F)
+        if image_is_pad is None:
+            return loss_tok.mean(dim=1)
+        B, n_frames = image_is_pad.shape
+        tf = self.video_temporal_downsample
+        # Fold pixel-frame padding to latent-frame resolution: frame 0 -> latent 0,
+        # then each group of `tf` tail frames -> one latent frame (padded only if all pad).
+        if tf <= 0 or (n_frames - 1) % tf != 0:
+            return loss_tok.mean(dim=1)
+        tail_pad = image_is_pad[:, 1:].view(B, -1, tf).all(dim=2)
+        video_is_pad = torch.cat([image_is_pad[:, :1], tail_pad], dim=1)  # (B, F)
+        if video_is_pad.shape[1] != loss_tok.shape[1]:
+            return loss_tok.mean(dim=1)
+        valid = (~video_is_pad).to(loss_tok)
+        return (loss_tok * valid).sum(dim=1) / valid.sum(dim=1).clamp(min=1.0)
 
     def build_inputs(self, sample, tiled: bool = False):
         video = sample["video"]
@@ -135,9 +145,9 @@ class FastWAMSana(nn.Module):
         context = context.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
         context_mask = context_mask.to(device=self.device, dtype=torch.bool, non_blocking=True)
 
-        # Proprio is conditioning for the *action* expert only. The SANA video
-        # DiT's caption embedder is sized to model_max_length, so we must not
-        # change the video text-token count.
+        # Proprio is conditioning for the *action* expert only. Appending it to
+        # the video DiT's text tokens would make L = model_max_length + 1, which
+        # the SANA caption embedder asserts against (L must be <= model_max_length).
         proprio_first = None
         if self.proprio_encoder is not None:
             if proprio is None:
@@ -182,8 +192,7 @@ class FastWAMSana(nn.Module):
             noisy_v, t_v, y, mask=context_mask
         )
 
-        loss_v_token = F.mse_loss(pred_v.float(), target_v.float(), reduction="none").mean(dim=(1, 3, 4))
-        loss_v_per = loss_v_token.mean(dim=1)
+        loss_v_per = self._video_loss_per_sample(pred_v, target_v, inputs["image_is_pad"])
         w_v = self.train_video_scheduler.training_weight(t_v).to(loss_v_per)
         loss_video = (loss_v_per * w_v).mean()
 
