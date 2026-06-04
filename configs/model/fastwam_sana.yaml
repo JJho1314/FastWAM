@@ -9,7 +9,8 @@ text_dim: 2304
 feature_layer: -1
 train_video_expert: true
 detach_video_feats: false
-grad_checkpointing: true
+grad_checkpointing: false   # plenty of GPU RAM; off = faster + avoids the LiteLA
+                            # 'misaligned address' that only triggers under checkpointing
 fp32_attention: true   # SANA LiteLA linear attn is unstable in bf16 -> NaN; run attn in fp32
 
 video_dit:
@@ -42,7 +43,7 @@ action_dit:
   num_heads: 24
   attn_head_dim: 128
   num_layers: 30
-  use_gradient_checkpointing: true
+  use_gradient_checkpointing: false
 action_dit_pretrained_path: checkpoints/ActionDiT_linear_interp_Wan22_alphascale_1024hdim.pt
 
 vae:

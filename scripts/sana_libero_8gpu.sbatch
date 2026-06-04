@@ -23,7 +23,10 @@ conda activate fastwam_sana
 export HF_HOME=/data/user/jhe724/.cache/huggingface
 export TOKENIZERS_PARALLELISM=false
 export OMP_NUM_THREADS=8
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+# NOTE: do NOT set expandable_segments:True — it causes CUDA 'misaligned address'
+# with the SANA kernels at per-GPU batch > 2 (the fault location moves around,
+# a tell-tale of allocator-level misalignment rather than an op bug).
+unset PYTORCH_CUDA_ALLOC_CONF || true
 # Intranet wandb is on 10.x; the HTTP proxy must stay unset for it to be reachable.
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY || true
 
