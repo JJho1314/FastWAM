@@ -15,9 +15,11 @@ echo "[2/5] mmcv 1.7.2 (lite, pure-python) + addict/yapf"
 pip install $OFF addict yapf
 MMCV_WITH_OPS=0 pip install "mmcv==1.7.2" --no-build-isolation --no-deps $OFF
 
-echo "[3/5] diffusers 0.38 + misc"
+echo "[3/5] diffusers 0.38 + misc + ffmpeg (torchcodec needs it; else lerobot"
+echo "      falls back to pyav, which leaks host RAM and OOM-kills long runs)"
 pip install -U "diffusers==0.38.0" --no-deps $OFF
-pip install $OFF qwen_vl_utils ftfy termcolor easydict
+pip install $OFF qwen_vl_utils ftfy termcolor easydict opencv-python-headless
+conda install -y -c conda-forge "ffmpeg<8"
 
 echo "[4/5] point editable fastwam install at FastWAM_sana"
 pip install -e "$REPO" --no-deps

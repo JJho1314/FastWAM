@@ -205,6 +205,13 @@ Verified: loads the pretrained 2B weights, trains stably on 8×H100
 - **Memory.** One 48 GB GPU cannot hold the full 2B AdamW states; use ≥2 GPUs
   (ZeRO-2 shards optimizer states + grads). `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`
   is exported by the launch script.
+- **Video-feature norm.** The action expert LayerNorm-normalizes the video DiT
+  features before cross-attention; without it the ~1e5-magnitude features make
+  the action loss explode the (trainable) video DiT's bf16 gradients → NaN.
+- **Host-RAM OOM / `ffmpeg`.** `torchcodec` needs an FFmpeg (4–7) in the env;
+  otherwise lerobot falls back to **pyav**, which leaks host RAM and gets the
+  job OOM-killed after ~600 steps. Install it: `conda install -c conda-forge "ffmpeg<8"`.
+  The sbatch uses `--mem=0` (whole node).
 - **Knobs** (`configs/model/fastwam_sana.yaml`):
   - `train_video_expert: false` → freeze SANA, train only the action expert
     (the "frozen world-model encoder" ablation; far less memory).

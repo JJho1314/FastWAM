@@ -3,7 +3,7 @@
 #SBATCH -p acd_u
 #SBATCH --gres=gpu:8
 #SBATCH -c 64
-#SBATCH --mem=512G
+#SBATCH --mem=0
 #SBATCH -t 1-00:00:00
 #SBATCH -o /data/user/jhe724/workspace/FastWAM_sana/runs/_slurm/%x_%j.out
 #SBATCH -e /data/user/jhe724/workspace/FastWAM_sana/runs/_slurm/%x_%j.err
