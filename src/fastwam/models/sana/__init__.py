@@ -9,7 +9,8 @@ unchanged from the Wan22 path.
 """
 
 from .action_expert import SanaActionExpert
+from .action_expert_dit import SanaActionExpertDiT
 from .video_expert import SanaVideoExpert
 from .fastwam_sana import FastWAMSana
 
-__all__ = ["SanaActionExpert", "SanaVideoExpert", "FastWAMSana"]
+__all__ = ["SanaActionExpert", "SanaActionExpertDiT", "SanaVideoExpert", "FastWAMSana"]

@@ -442,6 +442,8 @@ def create_fastwam_sana(
     action_dit,
     vae,
     video_dit_pretrained_path: str | None = None,
+    action_dit_pretrained_path: str | None = None,
+    skip_action_dit_load: bool = False,
     action_dim: int = 7,
     proprio_dim: int | None = None,
     text_dim: int = 2304,
@@ -466,7 +468,8 @@ def create_fastwam_sana(
     if sana_repo_path not in sys.path:
         sys.path.insert(0, sana_repo_path)
 
-    from .models.sana import SanaVideoExpert, SanaActionExpert, FastWAMSana
+    from .models.sana import SanaVideoExpert, SanaActionExpert, SanaActionExpertDiT, FastWAMSana
+    from .models.wan22.action_dit import ActionDiT
 
     def _to_dict(x, name):
         if isinstance(x, DictConfig):
@@ -550,16 +553,35 @@ def create_fastwam_sana(
         return z
 
     # ---- build action expert ----
-    action_expert = SanaActionExpert(
-        action_dim=int(action_dim),
-        hidden_size=int(action_dit.get("hidden_size", 1024)),
-        depth=int(action_dit.get("depth", 12)),
-        num_heads=int(action_dit.get("num_heads", 8)),
-        video_feat_dim=video_expert.hidden_size,
-        text_dim=int(text_dim),
-        mlp_ratio=float(action_dit.get("mlp_ratio", 4.0)),
-        max_action_len=int(action_dit.get("max_action_len", 64)),
-    ).to(device).to(model_dtype)
+    # If the action_dit config is ActionDiT-style (has `num_layers`), use the
+    # original Wan22 ActionDiT initialised from the interpolated backbone
+    # (non-random init). Otherwise fall back to the from-scratch SanaActionExpert.
+    if "num_layers" in action_dit:
+        adit_cfg = dict(action_dit)
+        adit_cfg["action_dim"] = int(action_dim)
+        action_dit_module = ActionDiT.from_pretrained(
+            action_dit_config=adit_cfg,
+            action_dit_pretrained_path=action_dit_pretrained_path,
+            skip_dit_load_from_pretrain=bool(skip_action_dit_load),
+            device=device,
+            torch_dtype=model_dtype,
+        )
+        action_expert = SanaActionExpertDiT(
+            action_dit=action_dit_module,
+            video_feat_dim=video_expert.hidden_size,
+            text_feat_dim=int(text_dim),
+        ).to(device).to(model_dtype)
+    else:
+        action_expert = SanaActionExpert(
+            action_dim=int(action_dim),
+            hidden_size=int(action_dit.get("hidden_size", 1024)),
+            depth=int(action_dit.get("depth", 12)),
+            num_heads=int(action_dit.get("num_heads", 8)),
+            video_feat_dim=video_expert.hidden_size,
+            text_dim=int(text_dim),
+            mlp_ratio=float(action_dit.get("mlp_ratio", 4.0)),
+            max_action_len=int(action_dit.get("max_action_len", 64)),
+        ).to(device).to(model_dtype)
 
     model = FastWAMSana(
         video_expert=video_expert,

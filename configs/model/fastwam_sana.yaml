@@ -31,12 +31,19 @@ video_dit:
   class_dropout_prob: 0.0
   t_kernel_size: 3
 
+# Action expert = original Wan22 ActionDiT, initialised from the interpolated
+# Wan-video-DiT backbone (non-random). Cross-attends to [video feats ; text].
 action_dit:
-  hidden_size: 1024
-  depth: 12
-  num_heads: 8
-  mlp_ratio: 4.0
-  max_action_len: 64
+  hidden_dim: 1024
+  ffn_dim: 4096
+  text_dim: 4096
+  freq_dim: 256
+  eps: 1.0e-6
+  num_heads: 24
+  attn_head_dim: 128
+  num_layers: 30
+  use_gradient_checkpointing: true
+action_dit_pretrained_path: checkpoints/ActionDiT_linear_interp_Wan22_alphascale_1024hdim.pt
 
 vae:
   z_dim: 16

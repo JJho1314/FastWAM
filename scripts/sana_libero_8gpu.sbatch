@@ -49,6 +49,7 @@ accelerate launch \
   "model.sana_repo_path=${SANA_REPO}" \
   "model.video_dit_pretrained_path=${SANA_W}/checkpoints/SANA_Video_2B_480p.pth" \
   "model.vae.vae_pth=${SANA_W}/vae/Wan2.1_VAE.pth" \
+  "model.action_dit_pretrained_path=/data/user/jhe724/workspace/FastWAM/checkpoints/ActionDiT_linear_interp_Wan22_alphascale_1024hdim.pt" \
   wandb.enabled=true wandb.mode=online \
   "wandb.workspace=${WANDB_ENTITY_}" "wandb.project=${WANDB_PROJECT_}" "wandb.name=${WANDB_NAME_}" \
   ${EXTRA:-}
