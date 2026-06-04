@@ -1,0 +1,26 @@
+# FSDP — the parallelism SANA itself uses (its train script sets FSDP_* env vars).
+# FULL_SHARD shards params+grads+optimizer across GPUs (like ZeRO-3) but via
+# PyTorch-native FSDP, which the SANA kernels are tested with — so it avoids the
+# DeepSpeed 'misaligned address' AND keeps per-GPU memory low (large batch OK).
+compute_environment: LOCAL_MACHINE
+debug: false
+distributed_type: FSDP
+mixed_precision: bf16
+fsdp_config:
+  fsdp_auto_wrap_policy: TRANSFORMER_BASED_WRAP
+  fsdp_transformer_layer_cls_to_wrap: SanaVideoMSBlock,DiTBlock
+  fsdp_sharding_strategy: FULL_SHARD
+  fsdp_backward_prefetch: BACKWARD_PRE
+  fsdp_forward_prefetch: false
+  fsdp_offload_params: false
+  fsdp_state_dict_type: FULL_STATE_DICT
+  fsdp_sync_module_states: true
+  fsdp_use_orig_params: true
+  fsdp_cpu_ram_efficient_loading: false
+machine_rank: 0
+main_training_function: main
+num_machines: 1
+num_processes: 2
+rdzv_backend: static
+same_network: true
+use_cpu: false

@@ -65,7 +65,11 @@ class Wan22Trainer:
         logger.info(
             "Accelerate training: distributed_type=%s zero_stage=%s world_size=%d process_index=%d cfg_mixed_precision=%s accelerator_mixed_precision=%s grad_accum=%d grad_clip=%.4f",
             self.accelerator.distributed_type,
-            self.accelerator.state.deepspeed_plugin.deepspeed_config.get("zero_optimization", {}).get("stage", "unknown"),
+            (
+                self.accelerator.state.deepspeed_plugin.deepspeed_config.get("zero_optimization", {}).get("stage", "unknown")
+                if getattr(self.accelerator.state, "deepspeed_plugin", None) is not None
+                else "none"
+            ),
             self.accelerator.num_processes,
             self.accelerator.process_index,
             self.mixed_precision,
@@ -668,10 +672,12 @@ class Wan22Trainer:
                 continue
 
             with self.accelerator.accumulate(self.model):
-                train_model = self.model if hasattr(self.model, "training_loss") else self.accelerator.unwrap_model(self.model)
-
                 with self.accelerator.autocast():
-                    loss, loss_dict = train_model.training_loss(sample)
+                    # Call the *wrapped* model's forward (== training_loss) rather
+                    # than `.training_loss(...)` directly, so FSDP's forward pre-hook
+                    # all-gathers the sharded params (otherwise the root patch-embed
+                    # Conv3d sees a flat weight). DeepSpeed/DDP are unaffected.
+                    loss, loss_dict = self.model(sample)
                 self.accelerator.backward(loss)
 
                 if self.accelerator.sync_gradients:

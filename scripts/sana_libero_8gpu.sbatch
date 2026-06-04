@@ -30,6 +30,23 @@ unset PYTORCH_CUDA_ALLOC_CONF || true
 # Intranet wandb is on 10.x; the HTTP proxy must stay unset for it to be reachable.
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY || true
 
+# --- FSDP env (mirrors SANA's set_fsdp_env). Only when launching with an FSDP
+# accelerate config; the yaml fsdp_* keys aren't always honored, but these env
+# vars are. FSDP_USE_ORIG_PARAMS=true is essential — without it FSDP flattens
+# the patch-embed Conv3d weight ("weight should have at least three dimensions").
+if [[ "${ACCEL_CFG:-}" == *fsdp* ]]; then
+  export ACCELERATE_USE_FSDP=true
+  export FSDP_SHARDING_STRATEGY=FULL_SHARD
+  export FSDP_AUTO_WRAP_POLICY=TRANSFORMER_BASED_WRAP
+  export FSDP_TRANSFORMER_CLS_TO_WRAP=SanaVideoMSBlock,DiTBlock
+  export FSDP_USE_ORIG_PARAMS=true
+  export FSDP_BACKWARD_PREFETCH=BACKWARD_PRE
+  export FSDP_FORWARD_PREFETCH=false
+  export FSDP_STATE_DICT_TYPE=FULL_STATE_DICT
+  export FSDP_SYNC_MODULE_STATES=true
+  export FSDP_CPU_RAM_EFFICIENT_LOADING=false
+fi
+
 # --- intranet (on-prem) Weights & Biases ---
 # Auth comes from ~/.netrc (machine 10.12.1.245:8080). Override via env if needed.
 export WANDB_BASE_URL="${WANDB_BASE_URL:-http://10.12.1.245:8080}"
@@ -46,7 +63,7 @@ SANA_REPO=/data/user/jhe724/workspace/Sana
 SANA_W=/data/user/jhe724/weights/SANA-Video_2B_480p
 
 accelerate launch \
-  --config_file scripts/accelerate_configs/accelerate_zero2_sana.yaml \
+  --config_file "${ACCEL_CFG:-scripts/accelerate_configs/accelerate_zero1_sana.yaml}" \
   --num_processes "$NPROC" \
   scripts/train.py task=libero_sana_2cam224_1e-4 \
   "model.sana_repo_path=${SANA_REPO}" \

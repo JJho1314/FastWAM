@@ -70,11 +70,11 @@ class FastWAMSana(nn.Module):
         self.loss_lambda_video = float(loss_lambda_video)
         self.loss_lambda_action = float(loss_lambda_action)
 
-        # Trainer trains exactly `self.dit.parameters()` (+ proprio_encoder).
-        dit = nn.ModuleDict({"action": action_expert})
-        if train_video_expert:
-            dit["video"] = video_expert
-        self.dit = dit
+        # The trainer trains exactly `self.dit.parameters()`. `dit` is a
+        # *property* (below), NOT a registered submodule, so the experts are
+        # registered only once (as self.video_expert / self.action_expert).
+        # Registering them a second time under self.dit would make FSDP's
+        # recursive wrap visit the same module twice -> AssertionError.
         self.train_video_expert = bool(train_video_expert)
 
         self.proprio_dim = None if proprio_dim is None else int(proprio_dim)
@@ -89,6 +89,16 @@ class FastWAMSana(nn.Module):
         self.train_action_scheduler = WanContinuousFlowMatchScheduler(
             num_train_timesteps=action_num_train_timesteps, shift=action_train_shift
         )
+
+    @property
+    def dit(self):
+        """The trainable expert(s) the trainer optimizes. A non-registered view
+        (built on access) so the experts aren't double-registered as submodules
+        (which breaks FSDP's recursive wrap)."""
+        modules = {"action": self.action_expert}
+        if self.train_video_expert:
+            modules["video"] = self.video_expert
+        return nn.ModuleDict(modules)
 
     # ------------------------------------------------------------------ utils
     def _vae_encode(self, video: torch.Tensor) -> torch.Tensor:
