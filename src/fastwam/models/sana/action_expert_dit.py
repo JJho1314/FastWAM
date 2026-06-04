@@ -25,6 +25,11 @@ class SanaActionExpertDiT(nn.Module):
         super().__init__()
         self.dit = action_dit
         ctx_dim = int(action_dit.text_dim)
+        # The SANA video DiT's raw block features are huge (~1e5); normalize the
+        # cross-attention memory before projecting so the context is unit-scale
+        # (otherwise the ActionDiT cross-attends to ~1e5 values -> loss explodes).
+        self.video_norm = nn.LayerNorm(int(video_feat_dim))
+        self.text_norm = nn.LayerNorm(int(text_feat_dim))
         # New (random-init) projections of the cross-attention memory into the
         # ActionDiT's context dim, so its text_embedding loads from the ckpt.
         self.video_proj = nn.Linear(int(video_feat_dim), ctx_dim)
@@ -40,8 +45,8 @@ class SanaActionExpertDiT(nn.Module):
         text_mask:    (B, L) bool
         """
         dt = noisy_action.dtype
-        vctx = self.video_proj(video_feats.to(dt))
-        tctx = self.text_proj(text_context.to(dt))
+        vctx = self.video_proj(self.video_norm(video_feats.to(dt)))
+        tctx = self.text_proj(self.text_norm(text_context.to(dt)))
         context = torch.cat([vctx, tctx], dim=1)  # (B, Nv+L, ctx_dim)
 
         B = context.shape[0]
