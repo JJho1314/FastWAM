@@ -36,6 +36,7 @@ class FastWAMCosmos(nn.Module):
         vae_encode_fn: Optional[Callable] = None,
         vae_name: str = "CosmosWan2pt1",
         crossattn_dim: int = 1024,
+        qwen_dim: int = 3584,
         proprio_dim: Optional[int] = None,
         device: str = "cpu",
         torch_dtype: torch.dtype = torch.bfloat16,
@@ -60,6 +61,13 @@ class FastWAMCosmos(nn.Module):
         nv, na = len(video_expert.net.blocks), len(action_expert.blocks)
         if nv != na:
             raise ValueError(f"MoT needs equal block counts: video={nv} action={na}")
+
+        # Qwen2.5-VL text embeds are 3584-dim; the MiniTrainDIT crossattn wants 1024.
+        # A learned projection (trained) avoids needing Cosmos' exact text projection.
+        self.text_proj = (
+            nn.Linear(int(qwen_dim), self.crossattn_dim).to(torch_dtype)
+            if int(qwen_dim) != self.crossattn_dim else nn.Identity()
+        )
 
         self.proprio_dim = None if proprio_dim is None else int(proprio_dim)
         self.proprio_encoder = (
@@ -135,7 +143,7 @@ class FastWAMCosmos(nn.Module):
         inp = self.build_inputs(sample, tiled=tiled)
         latents = inp["input_latents"]
         action = inp["action"]
-        crossattn = inp["context"]  # Qwen2.5-VL text embeds [B, N, 1024]
+        crossattn = self.text_proj(inp["context"])  # Qwen 3584 -> crossattn_dim (1024)
         B = latents.shape[0]
 
         # append proprio token to the text context (action-conditioning side info)

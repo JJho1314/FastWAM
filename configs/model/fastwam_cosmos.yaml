@@ -1,0 +1,23 @@
+_target_: fastwam.models.cosmos.runtime.create_fastwam_cosmos
+
+# Cosmos-Predict2.5-2B base/pre-trained EMA checkpoint (overridden by the sbatch).
+video_dit_pretrained_path: /data/user/jhe724/workspace/weights/Cosmos-Predict2.5-2B/base/pre-trained/d20b7120-df3e-4911-919d-db6e08bad31c_ema_bf16.pt
+
+action_dim: ${data.train.processor.action_output_dim}
+proprio_dim: ${data.train.processor.proprio_output_dim}
+crossattn_dim: 1024        # MiniTrainDIT crossattn_emb_channels (Qwen 3584 -> 1024 via model text_proj)
+atten_backend: torch       # SDPA so the MoT joint masked attention + no-CP works
+train_video_expert: true
+
+vae:
+  vae_pth: /data/user/jhe724/workspace/weights/Cosmos-Predict2.5-2B/tokenizer.pth
+
+video_scheduler:
+  train_shift: 3.0          # Cosmos rectified-flow shift
+  num_train_timesteps: 1000
+action_scheduler:
+  train_shift: 3.0
+  num_train_timesteps: 1000
+loss:
+  lambda_video: 1.0
+  lambda_action: 1.0
