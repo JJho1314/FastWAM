@@ -101,3 +101,46 @@ over action-token positions. Init by interpolating the Cosmos video DiT blocks
 `MiniTrainDIT.forward` (top level, ~1805): RoPE generation (`VideoRopePosition3DEmb`),
 `PatchEmbed`, the block loop, `FinalLayer`, timestep→emb. Need the exact RoPE tensor
 + how blocks are iterated, to drive both streams layer-by-layer through the MoT.
+
+---
+
+## Step 1 DONE — MiniTrainDIT.forward + exact 2B net config
+
+### `MiniTrainDIT.forward` (minimal_v4_dit.py:1712-1798):
+```
+x_B_T_H_W_D, rope_emb_L_1_1_D, extra_pos = prepare_embedded_sequence(x_B_C_T_H_W, fps)
+  # x_embedder=PatchEmbed -> [B,T,H,W,D];  rope from self.pos_embedder (VideoRope3D)
+if use_crossattn_projection: crossattn_emb = crossattn_proj(crossattn_emb)  # Qwen 3584->1024
+t_emb_B_T_D, adaln_lora_B_T_3D = t_embedder(timesteps_B_T); t_emb = t_embedding_norm(t_emb)
+for block in self.blocks:                  # the loop we intercept for MoT
+    x = block(x, t_emb, crossattn, rope_emb, adaln_lora, extra_pos)
+x = final_layer(x, t_emb, adaln_lora);  return unpatchify(x)   # -> [B,C,T,H,W]
+```
+=> MoT driver: run patch+rope+t_emb for video; build action tokens+rope+t_emb;
+   loop layers calling `mot_block_forward(vblk, ablk, vstream, astream)`; then each
+   stream's `final_layer`. adaln_lora is per-stream and MUST be passed to `_adaln`.
+
+### Exact Predict2.5-2B net config (`COSMOS_V1_2B_NET_MININET`, text2world/defaults/net.py:49):
+```
+MiniTrainDIT(in_channels=16, out_channels=16, patch_spatial=2, patch_temporal=1,
+  model_channels=2048, num_blocks=28, num_heads=16,   # head_dim = 2048/16 = 128
+  concat_padding_mask=True, pos_emb_cls="rope3d", pos_emb_learnable=True,
+  use_adaln_lora=True, adaln_lora_dim=256, extra_per_block_abs_pos_emb=False,
+  rope_*_extrapolation_ratio=1.0, max_img_h/w=240, max_frames=128)
+```
+CORRECTIONS vs first map: patch is **2×2 spatial / 1 temporal** (NOT 8×8);
+**use_adaln_lora=True**; default `atten_backend="minimal_a2a"` — we will build the
+net with **atten_backend="torch"** (same weights, but `torch_attention_op`=SDPA so the
+MoT joint masked attention + cross-attn work without context-parallel). Open: confirm
+the Predict2.5-2B ckpt matches V1_2B vs `COSMOS_V2_2B_NET` (differs: extra_pos_emb,
+no sac) — resolve by inspecting `base/pre-trained` checkpoint keys once env is up.
+
+### Tokenizer / weights layout (HPC3 `weights/Cosmos-Predict2.5-2B/`)
+`tokenizer.pth` (Wan2.1 VAE) + `base/{pre-trained,post-trained,distilled}/` (the DiT).
+Examples to crib the load path: `examples/{inference,action_conditioned,robot_multiview}.py`.
+
+## HPC3 debug env (in progress)
+uv-based (NOT conda): fresh official clone at
+`/data/user/jhe724/workspace/cosmos-predict2.5-fw`, `uv sync --extra=cu128` builds
+`.venv` (torch2.7-cu128 + transformer_engine). Run tests via that venv +
+`PYTHONPATH=<fastwam>/src`. FastWAM cosmos branch pushed to fork (clone/rsync to HPC3).
