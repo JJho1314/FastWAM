@@ -53,6 +53,11 @@ class CosmosActionExpert(nn.Module):
 
         # action-step token embed / un-embed (the only "new" weights besides AdaLN heads)
         self.action_encoder = nn.Linear(action_dim, model_channels)
+        # LayerNorm before the head: action tokens carry large-magnitude features
+        # from the joint attention with the Cosmos video DiT; without normalising
+        # them the action loss explodes after the first step (same failure mode the
+        # SANA variant hit). Mirrors the Cosmos final_layer's pre-projection norm.
+        self.head_norm = nn.LayerNorm(model_channels)
         self.head = nn.Linear(model_channels, action_dim)
         # zero-init the output head (diffusion convention): start by predicting zero
         # velocity so the action loss begins at ~||target||^2 instead of exploding
@@ -125,4 +130,4 @@ class CosmosActionExpert(nn.Module):
 
     def finalize(self, tokens_B_Ta_D):
         """Action tokens -> predicted velocity [B, Ta, action_dim]."""
-        return self.head(tokens_B_Ta_D)
+        return self.head(self.head_norm(tokens_B_Ta_D))
