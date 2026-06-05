@@ -5,11 +5,17 @@
 compute_environment: LOCAL_MACHINE
 debug: false
 distributed_type: FSDP
+# bf16 like the original FastWAM (model_dtype=bf16, on-the-fly VAE encode). fp32
+# was a mistake: it ~doubled SANA's all-gather bytes (123->225ms fwd) and forced
+# tiny batches for no real benefit. The only deviation from the original training
+# recipe is FSDP itself (SANA + DeepSpeed misaligns at per-GPU batch > 2).
 mixed_precision: bf16
 fsdp_config:
   fsdp_auto_wrap_policy: TRANSFORMER_BASED_WRAP
   fsdp_transformer_layer_cls_to_wrap: SanaVideoMSBlock,DiTBlock
-  fsdp_sharding_strategy: FULL_SHARD
+  # SHARD_GRAD_OP (=ZeRO-2): params resident (no per-layer forward all-gather),
+  # only grad+optimizer sharded. Overridden by FSDP_SHARD env in the sbatch.
+  fsdp_sharding_strategy: SHARD_GRAD_OP
   fsdp_backward_prefetch: BACKWARD_PRE
   fsdp_forward_prefetch: false
   fsdp_offload_params: false

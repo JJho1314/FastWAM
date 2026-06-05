@@ -568,6 +568,23 @@ class Wan22Trainer:
             result["action_l1"] = float(action_l1_mean)
         return result
 
+    def _prof_fb(self, fwd: float, bwd: float):
+        # FASTWAM_SANA_PROFILE: accumulate fwd/bwd wall time per micro-step and
+        # print the average every 40 micro-steps (~10 optimizer steps at accum=4).
+        st = getattr(self, "_prof_fb_state", None)
+        if st is None:
+            st = {"n": 0, "fwd": 0.0, "bwd": 0.0}
+            self._prof_fb_state = st
+        st["n"] += 1
+        st["fwd"] += fwd
+        st["bwd"] += bwd
+        if st["n"] % 40 == 0:
+            n = st["n"]
+            f = st["fwd"] / n * 1000
+            b = st["bwd"] / n * 1000
+            print(f"[PROFILE-FB] n={n} per-microstep: fwd={f:.1f}ms bwd={b:.1f}ms "
+                  f"fwd+bwd={f + b:.1f}ms", flush=True)
+
     def _save_weights_checkpoint(self, step_tag: str):
         model = self.accelerator.unwrap_model(self.model)
         ckpt_path = os.path.join(self.weights_dir, f"{step_tag}.pt")
@@ -589,7 +606,12 @@ class Wan22Trainer:
 
         self.accelerator.wait_for_everyone()
         ckpt_path = None
-        if self.accelerator.is_main_process:
+        # The custom weights .pt does `model.dit.state_dict()` on rank 0 only.
+        # Under FSDP that is a collective all-gather, so rank-0-only -> the other
+        # ranks deadlock at wait_for_everyone -> NCCL timeout / SIGABRT. For FSDP
+        # rely on `accelerator.save_state` below (FSDP-aware, all ranks) instead.
+        is_fsdp = "FSDP" in str(self.accelerator.distributed_type)
+        if self.accelerator.is_main_process and not is_fsdp:
             ckpt_path = self._save_weights_checkpoint(step_tag=step_tag)
         self.accelerator.wait_for_everyone()
 
@@ -671,14 +693,22 @@ class Wan22Trainer:
                 data_iter = iter(self.train_loader)
                 continue
 
+            _prof = bool(os.environ.get("FASTWAM_SANA_PROFILE"))
             with self.accelerator.accumulate(self.model):
+                if _prof:
+                    torch.cuda.synchronize(); _tf0 = time.perf_counter()
                 with self.accelerator.autocast():
                     # Call the *wrapped* model's forward (== training_loss) rather
                     # than `.training_loss(...)` directly, so FSDP's forward pre-hook
                     # all-gathers the sharded params (otherwise the root patch-embed
                     # Conv3d sees a flat weight). DeepSpeed/DDP are unaffected.
                     loss, loss_dict = self.model(sample)
+                if _prof:
+                    torch.cuda.synchronize(); _tf1 = time.perf_counter()
                 self.accelerator.backward(loss)
+                if _prof:
+                    torch.cuda.synchronize()
+                    self._prof_fb(fwd=_tf1 - _tf0, bwd=time.perf_counter() - _tf1)
 
                 if self.accelerator.sync_gradients:
                     grad_norm = self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)

@@ -455,6 +455,7 @@ def create_fastwam_sana(
     video_scheduler=None,
     action_scheduler=None,
     loss=None,
+    vae_latent_cache_path: str | None = None,
     model_dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
 ):
@@ -601,6 +602,7 @@ def create_fastwam_sana(
         action_num_train_timesteps=int(action_scheduler.get("num_train_timesteps", 1000)),
         loss_lambda_video=float(loss.get("lambda_video", 1.0)),
         loss_lambda_action=float(loss.get("lambda_action", 1.0)),
+        vae_latent_cache_path=(str(vae_latent_cache_path) if vae_latent_cache_path else None),
     )
     if proprio_dim is not None:
         model.proprio_encoder = model.proprio_encoder.to(device).to(model_dtype)

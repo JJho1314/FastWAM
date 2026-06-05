@@ -12,6 +12,7 @@ detach_video_feats: false
 grad_checkpointing: false   # plenty of GPU RAM; off = faster + avoids the LiteLA
                             # 'misaligned address' that only triggers under checkpointing
 fp32_attention: true   # SANA LiteLA linear attn is unstable in bf16 -> NaN; run attn in fp32
+vae_latent_cache_path: null   # set to the precompute output dir to skip the VAE encode (~28%/step)
 
 video_dit:
   model_name: SanaMSVideo_2000M_P2_D20

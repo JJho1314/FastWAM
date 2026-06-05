@@ -36,7 +36,11 @@ unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY || true
 # the patch-embed Conv3d weight ("weight should have at least three dimensions").
 if [[ "${ACCEL_CFG:-}" == *fsdp* ]]; then
   export ACCELERATE_USE_FSDP=true
-  export FSDP_SHARDING_STRATEGY=FULL_SHARD
+  # FULL_SHARD (=ZeRO-3) shards params too -> per-layer all-gather every micro-step,
+  # the dominant comm cost. SHARD_GRAD_OP (=ZeRO-2) keeps params resident (no forward
+  # all-gather, grad-accum doesn't re-gather) -> much faster; the 3.1B model fits.
+  # Override with FSDP_SHARD=SHARD_GRAD_OP.
+  export FSDP_SHARDING_STRATEGY=${FSDP_SHARD:-FULL_SHARD}
   export FSDP_AUTO_WRAP_POLICY=TRANSFORMER_BASED_WRAP
   export FSDP_TRANSFORMER_CLS_TO_WRAP=SanaVideoMSBlock,DiTBlock
   export FSDP_USE_ORIG_PARAMS=true

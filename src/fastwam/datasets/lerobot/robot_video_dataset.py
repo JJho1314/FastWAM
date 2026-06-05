@@ -230,6 +230,11 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             "image_is_pad": image_is_pad,
             "action_is_pad": sample["action_is_pad"],
             "proprio_is_pad": sample["proprio_is_pad"],
+            # Deterministic key for the VAE-latent cache: the *final* lerobot index
+            # whose video was actually loaded (after any skip-padding retry). The
+            # precompute writes cache[sample_idx] = vae_encode(video_of(sample_idx)),
+            # so loading by this key returns a byte-matching latent at train time.
+            "cache_key": int(sample_idx),
         }
         return data
 

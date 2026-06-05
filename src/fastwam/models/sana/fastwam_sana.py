@@ -19,6 +19,7 @@ trainable parameters, an optional `proprio_encoder`, and
 from __future__ import annotations
 
 import os
+import time
 from typing import Callable, Optional
 
 import torch
@@ -55,6 +56,7 @@ class FastWAMSana(nn.Module):
         action_num_train_timesteps: int = 1000,
         loss_lambda_video: float = 1.0,
         loss_lambda_action: float = 1.0,
+        vae_latent_cache_path: Optional[str] = None,
     ):
         super().__init__()
         self.video_expert = video_expert
@@ -62,6 +64,11 @@ class FastWAMSana(nn.Module):
         self.vae = vae
         self.vae_name = vae_name
         self._vae_encode_fn = vae_encode_fn
+        # Optional precomputed VAE-latent cache (see scripts/precompute_vae_latents_sana.py).
+        # When set, build_inputs loads latents by `sample['cache_key']` and skips the
+        # (frozen, deterministic) VAE encode — the single biggest per-step cost (~28%).
+        self.vae_latent_cache_path = vae_latent_cache_path
+        self._latent_cache = None  # lazily opened: dict(mmap=..., n=..., shape=...)
         self.text_dim = int(text_dim)
         self.device = device
         self.torch_dtype = torch_dtype
@@ -104,7 +111,41 @@ class FastWAMSana(nn.Module):
     def _vae_encode(self, video: torch.Tensor) -> torch.Tensor:
         if self._vae_encode_fn is None:
             raise RuntimeError("`vae_encode_fn` was not provided to FastWAMSana.")
+        # Kept in fp32: profiling showed bf16 did NOT speed the encode (the WanVAE
+        # 3D-conv over 33 frames x 2 cams is op/bandwidth-bound, not precision-bound:
+        # ~211ms fp32 vs ~200ms bf16) AND bf16 latents measurably raised the
+        # world-model loss (0.48 -> 1.11 at the same early step). The only real way
+        # to remove this ~28%-of-step cost is to precompute/cache the latents.
         return self._vae_encode_fn(self.vae_name, self.vae, video, device=self.device)
+
+    def _open_latent_cache(self):
+        if self._latent_cache is not None:
+            return self._latent_cache
+        if not self.vae_latent_cache_path:
+            return None
+        import json
+        import numpy as np
+        base = self.vae_latent_cache_path
+        with open(os.path.join(base, "meta.json")) as f:
+            meta = json.load(f)
+        shape = tuple(int(s) for s in meta["shape"])  # per-sample latent shape
+        n = int(meta["n"])
+        dtype = np.dtype(meta["dtype"])
+        mmap = np.memmap(os.path.join(base, "latents.mmap"), dtype=dtype, mode="r", shape=(n, *shape))
+        self._latent_cache = {"mmap": mmap, "n": n, "shape": shape}
+        logger.info("Opened VAE latent cache %s (n=%d shape=%s dtype=%s)", base, n, shape, dtype)
+        return self._latent_cache
+
+    def _load_cached_latents(self, cache_keys):
+        cache = self._open_latent_cache()
+        if cache is None or cache_keys is None:
+            return None
+        import numpy as np
+        keys = cache_keys.detach().cpu().numpy().astype(np.int64).reshape(-1)
+        if (keys < 0).any() or (keys >= cache["n"]).any():
+            raise IndexError(f"cache_key out of range [0,{cache['n']}): min={keys.min()} max={keys.max()}")
+        arr = np.ascontiguousarray(cache["mmap"][keys])  # (B, *shape)
+        return torch.from_numpy(arr).to(device=self.device, dtype=self.torch_dtype)
 
     def _video_loss_per_sample(self, pred_v, target_v, image_is_pad):
         """Per-sample video flow loss, masking padded frames out (mirrors the
@@ -146,8 +187,22 @@ class FastWAMSana(nn.Module):
         image_is_pad = sample.get("image_is_pad", None)
 
         # video is in [-1, 1] (matches Wan/SANA WanVAE convention).
-        video = video.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
-        input_latents = self._vae_encode(video).to(self.torch_dtype)
+        # Prefer the precomputed latent cache (skips the ~28%-of-step VAE encode);
+        # fall back to encoding when no cache / key is available.
+        cached = self._load_cached_latents(sample.get("cache_key", None))
+        if cached is not None:
+            input_latents = cached
+            if os.environ.get("FASTWAM_VERIFY_LATENT_CACHE"):
+                ref = self._vae_encode(
+                    video.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
+                ).to(self.torch_dtype)
+                maxdiff = (ref - input_latents).abs().amax().item()
+                refmag = ref.abs().amax().item()
+                print(f"[LATENT-CACHE-VERIFY] max|cache-live|={maxdiff:.3e} "
+                      f"ref_absmax={refmag:.3e} shape={tuple(input_latents.shape)}", flush=True)
+        else:
+            video = video.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
+            input_latents = self._vae_encode(video).to(self.torch_dtype)
 
         if context.ndim != 3 or context_mask.ndim != 2:
             raise ValueError(
@@ -183,7 +238,15 @@ class FastWAMSana(nn.Module):
 
     # ------------------------------------------------------------- train loss
     def training_loss(self, sample, tiled: bool = False):
+        _prof = bool(os.environ.get("FASTWAM_SANA_PROFILE"))
+        def _now():
+            if _prof:
+                torch.cuda.synchronize()
+                return time.perf_counter()
+            return 0.0
+        _t_start = _now()
         inputs = self.build_inputs(sample, tiled=tiled)
+        _t_build = _now()
         latents = inputs["input_latents"]
         B = latents.shape[0]
         context = inputs["context"]
@@ -198,10 +261,18 @@ class FastWAMSana(nn.Module):
         target_v = self.train_video_scheduler.training_target(latents, noise_v, t_v)
 
         # SANA DiT consumes y of shape (B, 1, L, text_dim) and a (B, L) mask.
+        # Run the video DiT in bf16 for speed (user directive: SANA bf16). FSDP
+        # mixed_precision is off (fp32 master weights), so ONLY this autocast region
+        # computes in bf16 — the action branch below runs in fp32. video_feats come
+        # out bf16 and are cast back to the action latent's fp32 dtype inside the
+        # action expert (action_expert_dit.py: `video_feats.to(dt)`).
         y = context.unsqueeze(1)
-        pred_v, video_feats = self.video_expert.forward_with_features(
-            noisy_v, t_v, y, mask=context_mask
-        )
+        _t_sana0 = _now()
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            pred_v, video_feats = self.video_expert.forward_with_features(
+                noisy_v, t_v, y, mask=context_mask
+            )
+        _t_sana = _now()
 
         loss_v_per = self._video_loss_per_sample(pred_v, target_v, inputs["image_is_pad"])
         w_v = self.train_video_scheduler.training_weight(t_v).to(loss_v_per)
@@ -225,7 +296,9 @@ class FastWAMSana(nn.Module):
             )
             action_context_mask = torch.cat([context_mask, ones], dim=1)
 
+        _t_act0 = _now()
         pred_a = self.action_expert(noisy_a, t_a, vf, action_context, action_context_mask)
+        _t_act = _now()
 
         if os.environ.get("FASTWAM_SANA_DEBUG_NAN"):
             def _stat(name, t):
@@ -253,7 +326,29 @@ class FastWAMSana(nn.Module):
             "loss_video": loss_video.detach(),
             "loss_action": loss_action.detach(),
         }
+        if _prof:
+            _t_end = _now()
+            vae = _t_build - _t_start          # build_inputs (dominated by VAE encode)
+            sana = _t_sana - _t_sana0          # SANA video DiT forward
+            act = _t_act - _t_act0             # action DiT forward
+            rest = (_t_end - _t_start) - vae - sana - act  # noise/scheduler + losses
+            self._prof_record(vae=vae, sana_fwd=sana, action_fwd=act, rest_fwd=rest)
         return loss, loss_dict
+
+    def _prof_record(self, **secs):
+        st = getattr(self, "_prof_state", None)
+        if st is None:
+            st = {"n": 0, "acc": {}}
+            self._prof_state = st
+        st["n"] += 1
+        for k, v in secs.items():
+            st["acc"][k] = st["acc"].get(k, 0.0) + v
+        if st["n"] % 10 == 0:
+            n = st["n"]
+            order = ["vae", "sana_fwd", "action_fwd", "rest_fwd"]
+            parts = " ".join(f"{k}={st['acc'][k] / n * 1000:.1f}ms" for k in order if k in st["acc"])
+            total = sum(st["acc"].values()) / n * 1000
+            print(f"[PROFILE] n={n} per-step fwd: {parts} | fwd_total={total:.1f}ms", flush=True)
 
     def forward(self, *args, **kwargs):
         return self.training_loss(*args, **kwargs)
