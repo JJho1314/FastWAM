@@ -54,6 +54,11 @@ class CosmosActionExpert(nn.Module):
         # action-step token embed / un-embed (the only "new" weights besides AdaLN heads)
         self.action_encoder = nn.Linear(action_dim, model_channels)
         self.head = nn.Linear(model_channels, action_dim)
+        # zero-init the output head (diffusion convention): start by predicting zero
+        # velocity so the action loss begins at ~||target||^2 instead of exploding
+        # (the action tokens carry large-magnitude features from the Cosmos blocks).
+        nn.init.zeros_(self.head.weight)
+        nn.init.zeros_(self.head.bias)
 
         # timestep embedding for the action diffusion (own copy; same shape as video)
         self.t_embedder = nn.Sequential(

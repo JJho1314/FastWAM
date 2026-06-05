@@ -65,7 +65,7 @@ class FastWAMCosmos(nn.Module):
         # Qwen2.5-VL text embeds are 3584-dim; the MiniTrainDIT crossattn wants 1024.
         # A learned projection (trained) avoids needing Cosmos' exact text projection.
         self.text_proj = (
-            nn.Linear(int(qwen_dim), self.crossattn_dim).to(torch_dtype)
+            nn.Linear(int(qwen_dim), self.crossattn_dim).to(device=device, dtype=torch_dtype)
             if int(qwen_dim) != self.crossattn_dim else nn.Identity()
         )
 

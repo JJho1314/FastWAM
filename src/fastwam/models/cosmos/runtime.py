@@ -18,8 +18,13 @@ logger = get_logger(__name__)
 
 
 def _cosmos_vae_encode(name, vae, video, device):
-    # video: [B, 3, T, H, W] in [-1, 1]; -> [B, 16, T/4, H/8, W/8] (normalised)
-    return vae.encode(video.to(device))
+    # video: [B, 3, T, H, W] in [-1, 1] -> [B, 16, T/4, H/8, W/8].
+    # Call the inner WanVAE.encode (applies the Wan2.1 `scale` normalisation, same
+    # as the SANA path) and SKIP the Wan2pt1VAEInterface's extra img/video mean-std
+    # normalisation, whose constants live in s3 files we don't have. The DiT adapts
+    # to the (scale-only) latent scale during fine-tuning. TODO: recover the Cosmos
+    # mean/std for an exact match.
+    return vae.model.encode(video.to(device))
 
 
 def create_fastwam_cosmos(
@@ -64,7 +69,9 @@ def create_fastwam_cosmos(
     if vae is not None:
         from cosmos_predict2._src.predict2.tokenizers.wan2pt1 import Wan2pt1VAEInterface
         vae_pth = vae["vae_pth"] if isinstance(vae, dict) else getattr(vae, "vae_pth", vae)
-        vae_model = Wan2pt1VAEInterface(vae_pth=str(vae_pth), load_mean_std=True)
+        # load_mean_std=False: the extra Cosmos mean/std files are s3-only; we use
+        # the inner WanVAE.encode (scale-normalised) in _cosmos_vae_encode instead.
+        vae_model = Wan2pt1VAEInterface(vae_pth=str(vae_pth), load_mean_std=False)
 
     video_scheduler = video_scheduler or {}
     action_scheduler = action_scheduler or {}
