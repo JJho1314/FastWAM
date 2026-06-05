@@ -88,9 +88,13 @@ class CosmosActionExpert(nn.Module):
         logger.info("CosmosActionExpert: copy-initialised %d blocks from video DiT.", len(self.blocks))
 
     def action_rope(self, video_net, Ta: int, device, dtype):
-        """Reuse the video net's 3-D RoPE on a [Ta,1,1] grid -> action-step RoPE."""
+        """Reuse the video net's 3-D RoPE on a [Ta,1,1] grid -> action-step RoPE.
+        fps (base_fps) is required when rope_enable_fps_modulation, else the rope
+        takes the image path which asserts T==1."""
         probe = torch.zeros(1, Ta, 1, 1, self.model_channels, device=device, dtype=dtype)
-        return video_net.pos_embedder.generate_embeddings(probe.shape, fps=None)
+        base_fps = float(getattr(video_net.pos_embedder, "base_fps", 16))
+        fps = torch.full((1,), base_fps, device=device)
+        return video_net.pos_embedder.generate_embeddings(probe.shape, fps=fps)
 
     def prepare(self, noisy_action_B_Ta_a, timesteps_B, crossattn_emb, video_net):
         """Embed action tokens + timestep emb + RoPE; return MoT stream state.

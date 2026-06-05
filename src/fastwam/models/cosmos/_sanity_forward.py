@@ -18,6 +18,7 @@ def build_2b_net(atten_backend="torch"):
 
     cfg = copy.deepcopy(COSMOS_V1_2B_NET_MININET)
     cfg.atten_backend = atten_backend  # SDPA backend so MoT masking + no-CP works
+    cfg.in_channels = 17  # base ckpt: 16 VAE latent + 1 conditioning channel
     net = instantiate(cfg)
     return net
 
@@ -57,13 +58,18 @@ def main():
     net = net.to(dev).to(torch.bfloat16).eval()
 
     # dummy forward: latent [B, C=16, T, H, W], timesteps [B, T], qwen crossattn [B, N, 1024]
-    B, C, T, H, W = 1, 16, 4, 16, 16
+    B, C, T, H, W = 1, 17, 4, 16, 16  # 16 latent + 1 conditioning channel
     from cosmos_predict2._src.predict2.conditioner import DataType
     x = torch.randn(B, C, T, H, W, device=dev, dtype=torch.bfloat16)
     t = torch.full((B, T), 500.0, device=dev, dtype=torch.bfloat16)
     crossattn = torch.randn(B, 16, 1024, device=dev, dtype=torch.bfloat16)
+    pad = torch.zeros(B, 1, H, W, device=dev, dtype=torch.bfloat16)  # concat_padding_mask=True needs it
+    # fps required when rope_enable_fps_modulation (else the rope takes the image
+    # path which asserts T==1); base_fps gives neutral temporal scaling.
+    base_fps = float(getattr(net.pos_embedder, "base_fps", 16))
+    fps = torch.full((B,), base_fps, device=dev)
     with torch.no_grad():
-        out = net(x, t, crossattn, data_type=DataType.VIDEO)
+        out = net(x, t, crossattn, fps=fps, padding_mask=pad, data_type=DataType.VIDEO)
     print("forward OK. out type:", type(out))
     if torch.is_tensor(out):
         print("out shape:", tuple(out.shape), "dtype:", out.dtype)

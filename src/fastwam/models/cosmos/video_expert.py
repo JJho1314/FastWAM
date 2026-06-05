@@ -35,7 +35,26 @@ def build_cosmos_2b_net(atten_backend: str = "torch"):
 
     cfg = copy.deepcopy(COSMOS_V1_2B_NET_MININET)
     cfg.atten_backend = atten_backend
+    # The Predict2.5-2B base ckpt was trained with in_channels=17 (16 VAE latent +
+    # 1 video2world conditioning channel); the default config says 16. Match the
+    # ckpt so x_embedder is (17+1)*patch = 72 (not 68).
+    cfg.in_channels = 17
     return instantiate(cfg)
+
+
+# how many of the 17 input channels are the conditioning channel (rest = VAE latent)
+COSMOS_LATENT_CHANNELS = 16
+COSMOS_IN_CHANNELS = 17
+
+
+def add_conditioning_channel(latent_B_C_T_H_W):
+    """Append the video2world conditioning channel (zeros = unconditional / predict
+    the whole clip, which is the FastWAM world-model objective)."""
+    if latent_B_C_T_H_W.shape[1] >= COSMOS_IN_CHANNELS:
+        return latent_B_C_T_H_W
+    B, C, T, H, W = latent_B_C_T_H_W.shape
+    cond = latent_B_C_T_H_W.new_zeros(B, COSMOS_IN_CHANNELS - C, T, H, W)
+    return torch.cat([latent_B_C_T_H_W, cond], dim=1)
 
 
 def load_net_state_dict(net, ckpt_path: str, strict: bool = False):
@@ -93,6 +112,10 @@ class CosmosVideoExpert(nn.Module):
         loop. Returns FLAT tokens so the MoT block fn can concat K/V across streams.
         """
         net = self.net
+        x_B_C_T_H_W = add_conditioning_channel(x_B_C_T_H_W)  # 16 -> 17 channels
+        if fps is None and getattr(net, "rope_enable_fps_modulation", True):
+            base_fps = float(getattr(net.pos_embedder, "base_fps", 16))
+            fps = torch.full((x_B_C_T_H_W.shape[0],), base_fps, device=x_B_C_T_H_W.device)
         if padding_mask is None and net.concat_padding_mask:
             # the model concatenates a padding-mask channel; an all-zero mask = "no pad"
             padding_mask = torch.zeros(
