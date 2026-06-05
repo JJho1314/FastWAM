@@ -58,20 +58,25 @@ def _adaln(block, emb_B_T_D, adaln_lora_B_T_3D=None):
     return {"self_attn": sa, "cross_attn": ca, "mlp": mlp}
 
 
-def _mod_flat(norm_layer, x_B_S_D, scale_B_T_D, shift_B_T_D, T, HW):
+def _mod_flat(norm_layer, x_B_S_D, scale_B_Tm_D, shift_B_Tm_D, T, HW):
     """LayerNorm + AdaLN modulate on flat tokens [B, S=T*HW, D].
 
-    The modulation is per-frame ([B,T,D]); broadcast it across the HW tokens of
-    each frame: [B,T,D] -> [B,T,1,D] -> [B, T*HW, D].
+    The modulation is per-frame ``[B, Tm, D]`` where ``Tm`` is 1 (one diffusion
+    timestep for the whole clip) or T (per-frame). Reshape tokens to [B,T,HW,D]
+    and broadcast the modulation as [B,Tm,1,D] over HW (and over T when Tm==1) —
+    matching the Cosmos Block's [B,T,1,1,D] broadcast over [B,T,H,W,D].
     """
-    scale = scale_B_T_D.unsqueeze(2).expand(-1, -1, HW, -1).reshape(x_B_S_D.shape).type_as(x_B_S_D)
-    shift = shift_B_T_D.unsqueeze(2).expand(-1, -1, HW, -1).reshape(x_B_S_D.shape).type_as(x_B_S_D)
-    return norm_layer(x_B_S_D) * (1 + scale) + shift
+    B, S, D = x_B_S_D.shape
+    x = norm_layer(x_B_S_D).view(B, T, HW, D)
+    scale = scale_B_Tm_D.unsqueeze(2).type_as(x)
+    shift = shift_B_Tm_D.unsqueeze(2).type_as(x)
+    return (x * (1 + scale) + shift).reshape(B, S, D)
 
 
-def _gate_flat(gate_B_T_D, out_B_S_D, T, HW):
-    gate = gate_B_T_D.unsqueeze(2).expand(-1, -1, HW, -1).reshape(out_B_S_D.shape).type_as(out_B_S_D)
-    return gate * out_B_S_D
+def _gate_flat(gate_B_Tm_D, out_B_S_D, T, HW):
+    B, S, D = out_B_S_D.shape
+    gate = gate_B_Tm_D.unsqueeze(2).type_as(out_B_S_D)
+    return (out_B_S_D.view(B, T, HW, D) * gate).reshape(B, S, D)
 
 
 class CosmosMoTStream:
