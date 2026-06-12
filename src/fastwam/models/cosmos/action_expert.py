@@ -131,3 +131,16 @@ class CosmosActionExpert(nn.Module):
     def finalize(self, tokens_B_Ta_D):
         """Action tokens -> predicted velocity [B, Ta, action_dim]."""
         return self.head(self.head_norm(tokens_B_Ta_D))
+
+    def forward_cross_attn(self, noisy_action_B_Ta_a, timesteps_B, context, video_net):
+        """Cross-attention coupling: action-only self-attention + cross-attention to
+        ``context`` (text + proprio + video features). The Cosmos Block.forward is
+        exactly self-attn -> cross-attn(context) -> MLP, so we run the action blocks
+        directly (no joint attention with the video stream). -> velocity [B,Ta,a]."""
+        a = self.prepare(noisy_action_B_Ta_a, timesteps_B, context, video_net)
+        B, Ta, D = a["tokens"].shape
+        x = a["tokens"].view(B, Ta, 1, 1, D)  # Cosmos Block expects [B,T,H,W,D]
+        for blk in self.blocks:
+            x = blk(x, a["t_emb"], context, rope_emb_L_1_1_D=a["rope"],
+                    adaln_lora_B_T_3D=a["adaln_lora"])
+        return self.finalize(x.view(B, Ta, D))

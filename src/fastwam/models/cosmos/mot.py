@@ -102,17 +102,22 @@ def mot_block_forward(
     action_block,
     video: CosmosMoTStream,
     action: CosmosMoTStream,
+    bidirectional: bool = False,
     video_mask: Optional[torch.Tensor] = None,
     action_mask: Optional[torch.Tensor] = None,
 ):
-    """One MoT layer: joint self-attention then per-stream cross-attn + MLP.
+    """One MoT layer: per-stream self/joint attention then per-stream cross-attn + MLP.
 
     Replicates ``Block.forward`` (minimal_v4_dit.py:1257-1382) for BOTH the video
-    and action Cosmos blocks, but with a single joint self-attention over the
-    concatenated K/V. Updates ``video.x`` / ``action.x`` in place and returns them.
+    and action Cosmos blocks. Updates ``video.x`` / ``action.x`` in place.
 
-    Masks (optional): broadcastable to [B, H, Sq, Sv+Sa], bool True=attend.
-    Default (None) = full bidirectional joint attention.
+    Coupling direction (matches the original FastWAM MoT, models/wan22/mot.py:
+    ``prefill_video_cache`` -> "Video prefill uses only video self-attention mask"):
+      - bidirectional=False (DEFAULT): the VIDEO attends to VIDEO only (independent
+        of the action, so the world model stays usable standalone); the ACTION
+        attends to the JOINT [video ; action] K/V.
+      - bidirectional=True: both streams attend the joint K/V (video also sees action).
+    Masks (optional): broadcastable to [B, H, Sq, Sk], bool True=attend.
     """
     mv = _adaln(video_block, video.t_emb, video.adaln_lora)
     ma = _adaln(action_block, action.t_emb, action.adaln_lora)
@@ -127,8 +132,12 @@ def mot_block_forward(
     k = torch.cat([kv, ka], dim=1)
     v = torch.cat([vv, va], dim=1)
 
-    ov = _sdpa_joint(qv, k, v, attn_mask=video_mask)   # [B,Sv,H*D]
-    oa = _sdpa_joint(qa, k, v, attn_mask=action_mask)  # [B,Sa,H*D]
+    # video: self-attn only (independent of action) unless bidirectional; action: joint
+    if bidirectional:
+        ov = _sdpa_joint(qv, k, v, attn_mask=video_mask)       # video sees video+action
+    else:
+        ov = _sdpa_joint(qv, kv, vv, attn_mask=video_mask)     # video sees video only
+    oa = _sdpa_joint(qa, k, v, attn_mask=action_mask)          # action sees video+action
 
     ov = video_block.self_attn.output_dropout(video_block.self_attn.output_proj(ov))
     oa = action_block.self_attn.output_dropout(action_block.self_attn.output_proj(oa))

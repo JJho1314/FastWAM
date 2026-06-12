@@ -37,6 +37,9 @@ class FastWAMCosmos(nn.Module):
         vae_name: str = "CosmosWan2pt1",
         crossattn_dim: int = 1024,
         qwen_dim: int = 3584,
+        coupling: str = "mot",            # "mot" (joint attention) | "cross_attn"
+        mot_bidirectional: bool = False,  # MoT: True = video also attends action (default False = original FastWAM: video independent)
+        feature_layer: int = -1,          # which video block's hidden state for cross_attn
         proprio_dim: Optional[int] = None,
         device: str = "cpu",
         torch_dtype: torch.dtype = torch.bfloat16,
@@ -68,6 +71,20 @@ class FastWAMCosmos(nn.Module):
             nn.Linear(int(qwen_dim), self.crossattn_dim).to(device=device, dtype=torch_dtype)
             if int(qwen_dim) != self.crossattn_dim else nn.Identity()
         )
+
+        # coupling: "mot" = joint masked attention (video+action attend jointly);
+        # "cross_attn" = video DiT runs standalone, action cross-attends to its
+        # hidden states (SANA-style, one-directional). Kept switchable to A/B them.
+        self.coupling = str(coupling)
+        self.mot_bidirectional = bool(mot_bidirectional)
+        self.feature_layer = int(feature_layer)
+        if self.coupling == "cross_attn":
+            # project the video DiT hidden (model_channels) -> crossattn_dim so the
+            # action cross-attention can consume [text ; proprio ; video features].
+            vdim = int(getattr(video_expert.net, "model_channels", 2048))
+            self.video_feat_proj = nn.Linear(vdim, self.crossattn_dim).to(device=device, dtype=torch_dtype)
+        else:
+            self.video_feat_proj = None
 
         self.proprio_dim = None if proprio_dim is None else int(proprio_dim)
         self.proprio_encoder = (
@@ -107,11 +124,32 @@ class FastWAMCosmos(nn.Module):
                               a["THW"][0], a["THW"][1] * a["THW"][2], a["adaln_lora"])
 
         for vblk, ablk in zip(self.video_expert.net.blocks, self.action_expert.blocks):
-            mot_block_forward(vblk, ablk, vs, as_)
+            mot_block_forward(vblk, ablk, vs, as_, bidirectional=self.mot_bidirectional)
 
         pred_v = self.video_expert.finalize(vs.x, v["t_emb"], v["adaln_lora"], v["THW"])
         pred_a = self.action_expert.finalize(as_.x)
         return pred_v, pred_a
+
+    # --------------------------------------------------------- cross-attn forward
+    def cross_attn_forward(self, noisy_latents, t_v, noisy_action, t_a, crossattn_emb):
+        """Video DiT runs standalone; the action DiT cross-attends to its hidden
+        states (one-directional: video unaffected by the action). Returns the same
+        (pred_v, pred_a) as mot_forward for a drop-in A/B comparison."""
+        pred_v, vfeat = self.video_expert.forward_standalone(
+            noisy_latents, t_v, crossattn_emb, feature_layer=self.feature_layer
+        )
+        vfeat = self.video_feat_proj(vfeat)  # [B, Sv, D] -> [B, Sv, crossattn_dim]
+        # action cross-attention memory = [text(+proprio) ; video features]
+        action_context = torch.cat([crossattn_emb, vfeat], dim=1)
+        pred_a = self.action_expert.forward_cross_attn(
+            noisy_action, t_a, action_context, self.video_expert.net
+        )
+        return pred_v, pred_a
+
+    def couple_forward(self, noisy_latents, t_v, noisy_action, t_a, crossattn_emb):
+        if self.coupling == "cross_attn":
+            return self.cross_attn_forward(noisy_latents, t_v, noisy_action, t_a, crossattn_emb)
+        return self.mot_forward(noisy_latents, t_v, noisy_action, t_a, crossattn_emb)
 
     # ------------------------------------------------------------- build inputs
     def build_inputs(self, sample, tiled: bool = False):
@@ -161,7 +199,7 @@ class FastWAMCosmos(nn.Module):
         noisy_a = self.train_action_scheduler.add_noise(action, noise_a, t_a)
         target_a = self.train_action_scheduler.training_target(action, noise_a, t_a)
 
-        pred_v, pred_a = self.mot_forward(noisy_v, t_v, noisy_a, t_a, crossattn)
+        pred_v, pred_a = self.couple_forward(noisy_v, t_v, noisy_a, t_a, crossattn)
 
         loss_v = F.mse_loss(pred_v.float(), target_v.float())
         w_v = self.train_video_scheduler.training_weight(t_v).to(loss_v)

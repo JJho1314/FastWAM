@@ -150,3 +150,28 @@ class CosmosVideoExpert(nn.Module):
         x_B_T_H_W_D = rearrange(tokens_B_S_D, "b (t h w) d -> b t h w d", t=T, h=H, w=W)
         x_B_T_H_W_O = self.net.final_layer(x_B_T_H_W_D, t_emb_B_T_D, adaln_lora_B_T_3D=adaln_lora_B_T_3D)
         return self.net.unpatchify(x_B_T_H_W_O)
+
+    def forward_standalone(self, x_B_C_T_H_W, timesteps_B_T, crossattn_emb,
+                           feature_layer=-1, fps=None, padding_mask=None):
+        """Run the FULL standard MiniTrainDIT forward (independent of the action
+        stream) and also return a block's hidden state. Used by the cross-attention
+        coupling: the video DiT runs on its own, the action DiT cross-attends to
+        these features. Returns (pred_v [B,C,T,H,W], video_feats [B, Sv, D]).
+        """
+        net = self.net
+        x_B_C_T_H_W = add_conditioning_channel(x_B_C_T_H_W)
+        if fps is None and getattr(net, "rope_enable_fps_modulation", True):
+            base_fps = float(getattr(net.pos_embedder, "base_fps", 16))
+            fps = torch.full((x_B_C_T_H_W.shape[0],), base_fps, device=x_B_C_T_H_W.device)
+        if padding_mask is None and net.concat_padding_mask:
+            padding_mask = torch.zeros(
+                x_B_C_T_H_W.shape[0], 1, x_B_C_T_H_W.shape[-2], x_B_C_T_H_W.shape[-1],
+                device=x_B_C_T_H_W.device, dtype=x_B_C_T_H_W.dtype,
+            )
+        n_blocks = len(net.blocks)
+        layer = feature_layer if feature_layer >= 0 else n_blocks + feature_layer
+        pred_v, feats = net(
+            x_B_C_T_H_W, timesteps_B_T, crossattn_emb, fps=fps, padding_mask=padding_mask,
+            intermediate_feature_ids=[layer],
+        )
+        return pred_v, feats[0]  # video_feats [B, Sv, D]

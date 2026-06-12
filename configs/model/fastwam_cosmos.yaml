@@ -6,6 +6,9 @@ video_dit_pretrained_path: /data/user/jhe724/workspace/weights/Cosmos-Predict2.5
 action_dim: ${data.train.processor.action_output_dim}
 proprio_dim: ${data.train.processor.proprio_output_dim}
 crossattn_dim: 1024        # MiniTrainDIT crossattn_emb_channels (Qwen 3584 -> 1024 via model text_proj)
+coupling: mot              # "mot" (joint attention) | "cross_attn" (action cross-attends video) — A/B switch
+mot_bidirectional: false   # MoT: false = video independent of action (original FastWAM); true = video also sees action
+feature_layer: -1          # cross_attn: which video block's hidden state the action reads
 atten_backend: torch       # SDPA so the MoT joint masked attention + no-CP works
 train_video_expert: true
 

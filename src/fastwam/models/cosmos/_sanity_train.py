@@ -9,13 +9,15 @@ import torch
 
 def main():
     ckpt, tokenizer = sys.argv[1], sys.argv[2]
+    coupling = sys.argv[3] if len(sys.argv) > 3 else "mot"
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     from fastwam.models.cosmos.runtime import create_fastwam_cosmos
+    print("coupling:", coupling)
 
     model = create_fastwam_cosmos(
         video_dit_pretrained_path=ckpt,
         vae={"vae_pth": tokenizer},
-        action_dim=7, proprio_dim=8, crossattn_dim=1024,
+        action_dim=7, proprio_dim=8, crossattn_dim=1024, coupling=coupling,
         video_scheduler={"train_shift": 3.0, "num_train_timesteps": 1000},
         action_scheduler={"train_shift": 3.0, "num_train_timesteps": 1000},
         loss={"lambda_video": 1.0, "lambda_action": 1.0},
