@@ -1,8 +1,10 @@
 # @package _global_
+# AGRA world<->action cross-attention variant of the LIBERO Cosmos task.
+# Identical to libero_cosmos_2cam224.yaml except model: fastwam_cosmos_agra.
 
 defaults:
   - override /data: libero_2cam_cosmos
-  - override /model: fastwam_cosmos
+  - override /model: fastwam_cosmos_agra
   - _self_
 
 # dataloading — 512 global batch = 8 (per-GPU) x 8 GPUs x 8 (grad accum)

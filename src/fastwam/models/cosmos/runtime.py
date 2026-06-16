@@ -12,6 +12,7 @@ import torch
 from fastwam.utils.logging_config import get_logger
 from .video_expert import CosmosVideoExpert
 from .action_expert import CosmosActionExpert
+from .foresight_action_head import ForesightActionHead
 from .fastwam_cosmos import FastWAMCosmos
 
 logger = get_logger(__name__)
@@ -24,7 +25,22 @@ def _cosmos_vae_encode(name, vae, video, device):
     # normalisation, whose constants live in s3 files we don't have. The DiT adapts
     # to the (scale-only) latent scale during fine-tuning. TODO: recover the Cosmos
     # mean/std for an exact match.
-    return vae.model.encode(video.to(device))
+    video = video.to(device)
+    # The VAE (Wan2pt1VAEInterface) is frozen and NOT a registered nn.Module submodule,
+    # so accelerate/FSDP never relocates it to each rank's GPU — it stays on its load
+    # device (cuda:0). Under multi-GPU, rank R's input is on cuda:R while the VAE conv
+    # weights sit on cuda:0 -> cross-device conv error. `vae.model` is a WanVAE wrapper
+    # (no `.to`); the real nn.Module is `vae.model.model`, and encode() also reads the
+    # mean/std/scale tensors. Relocate them all onto the input's device once.
+    wanvae = vae.model
+    dev = video.device
+    if next(wanvae.model.parameters()).device != dev:
+        wanvae.model.to(dev)
+        wanvae.device = dev
+        wanvae.mean = wanvae.mean.to(dev)
+        wanvae.std = wanvae.std.to(dev)
+        wanvae.scale = [wanvae.mean, 1.0 / wanvae.std]
+    return wanvae.encode(video)
 
 
 def create_fastwam_cosmos(
@@ -38,12 +54,27 @@ def create_fastwam_cosmos(
     feature_layer: int = -1,
     atten_backend: str = "torch",
     train_video_expert: bool = True,
+    # --- AGRA action-head (foresight cross-attention) hyperparameters ---
+    action_horizon: int | None = None,   # K (chunk length); informational, head is length-agnostic
+    agra_num_layers: int = 8,
+    agra_hidden: int = 1024,
+    agra_num_heads: int = 32,
+    agra_crossattn_dim: int = 2048,
     video_scheduler=None,
     action_scheduler=None,
     loss=None,
     model_dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
 ):
+    # Pin the CUDA *current device* to this rank's GPU BEFORE building any submodule,
+    # so that anything created with a bare "cuda" lands on this rank's GPU and not on
+    # cuda:0. In particular the Wan2.1 VAE (WanVAE hardcodes device="cuda") would
+    # otherwise build on cuda:0 for EVERY rank, leaving a ~1.4GB allocation per rank on
+    # GPU0 (~10GB wasted on rank 0's GPU) until first use. accelerate sets the same
+    # device later during prepare(), so this is a harmless early no-op for rank 0.
+    if isinstance(device, str) and device.startswith("cuda:") and torch.cuda.is_available():
+        torch.cuda.set_device(int(device.split(":", 1)[1]))
+
     # ---- video DiT (MiniTrainDIT-2B) ----
     video_expert = CosmosVideoExpert.from_pretrained(
         ckpt_path=video_dit_pretrained_path,
@@ -56,16 +87,35 @@ def create_fastwam_cosmos(
     num_blocks = len(net.blocks)
     num_heads = int(net.blocks[0].self_attn.n_heads)
 
-    # ---- action DiT (Cosmos blocks, copy-init from the video DiT) ----
-    action_expert = CosmosActionExpert(
-        action_dim=action_dim,
-        model_channels=model_channels,
-        num_blocks=num_blocks,
-        num_heads=num_heads,
-        crossattn_emb_channels=crossattn_dim,
-    )
-    action_expert.copy_init_from_video(net)
-    action_expert = action_expert.to(device=device, dtype=model_dtype)
+    # ---- action DiT ----
+    if coupling == "agra":
+        # AGRA: a standalone 8-layer cross-attention DiT (ForesightActionHead) that
+        # reads the video DiT's multi-layer foresight. NOT a Cosmos-block expert and
+        # NOT copy-init from the video DiT (different depth/width). Requires proprio
+        # (the prepended state token s0).
+        if proprio_dim is None:
+            raise ValueError("coupling=agra requires proprio_dim (the prepended s0 token).")
+        action_expert = ForesightActionHead(
+            action_dim=action_dim,
+            proprio_dim=int(proprio_dim),
+            num_layers=int(agra_num_layers),
+            hidden=int(agra_hidden),
+            num_heads=int(agra_num_heads),
+            crossattn_dim=int(agra_crossattn_dim),
+            action_horizon=action_horizon,
+        )
+        action_expert = action_expert.to(device=device, dtype=model_dtype)
+    else:
+        # mot / cross_attn: Cosmos-block action expert (copy-init from the video DiT).
+        action_expert = CosmosActionExpert(
+            action_dim=action_dim,
+            model_channels=model_channels,
+            num_blocks=num_blocks,
+            num_heads=num_heads,
+            crossattn_emb_channels=crossattn_dim,
+        )
+        action_expert.copy_init_from_video(net)
+        action_expert = action_expert.to(device=device, dtype=model_dtype)
 
     # ---- Cosmos Wan2.1 VAE tokenizer ----
     vae_model = None

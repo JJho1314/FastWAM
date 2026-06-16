@@ -53,6 +53,14 @@ class ResizeSmallestSideAspectPreserving:
             target_size[0] >= img_h and target_size[1] >= img_w
         ), f"Resize error. orig {(orig_w, orig_h)} desire {(img_w, img_h)} compute {target_size}"
 
+        # No-op short-circuit: if the resize target equals the current size, skip the
+        # resample entirely. This is a safe general optimization (resize to the same
+        # size is identity up to interpolation rounding), and it lets the pre-decoded
+        # frame cache path (already at the 224x448 concat target) avoid a redundant
+        # scale-1 BICUBIC resample. Behavior is unchanged whenever sizes differ.
+        if target_size == (orig_h, orig_w):
+            return video
+
         return transforms_F.resize(
             video,
             size=target_size,  # type: ignore
@@ -78,6 +86,14 @@ class CenterCrop:
         ), "Please specify size in args"
 
         img_w, img_h = self.args["img_w"], self.args["img_h"]
+
+        # No-op short-circuit: if the input is already exactly [img_h, img_w], a center
+        # crop is the identity. Returning the input avoids an unnecessary copy and keeps
+        # the cached-frames path (already 224x448) bit-for-bit identical to the input.
+        cur_w, cur_h = obtain_image_size(video)
+        if cur_h == img_h and cur_w == img_w:
+            return video
+
         return transforms_F.center_crop(video, [img_h, img_w])
 
 

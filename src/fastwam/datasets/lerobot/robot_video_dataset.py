@@ -12,6 +12,7 @@ from omegaconf import DictConfig, OmegaConf
 
 from hydra.utils import instantiate
 from .base_lerobot_dataset import BaseLerobotDataset
+from .lerobot.datasets.video_utils import set_frame_cache_dir
 from .utils.normalizer import save_dataset_stats_to_json, load_dataset_stats_from_json
 from ..dataset_utils import ResizeSmallestSideAspectPreserving, CenterCrop, Normalize
 from fastwam.utils.logging_config import get_logger
@@ -42,7 +43,16 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         max_padding_retry: int = 3,
         concat_multi_camera: str = "horizontal", # "horizontal", "vertical", "robotwin", or None
         override_instruction: Optional[str] = None, # whether to hardcode a specific instruction for all samples, for debugging
+        frame_cache_dir: Optional[str] = None, # pre-decoded frame cache dir; None = decode mp4 at runtime (back-compatible)
     ):
+        # Set the pre-decoded frame cache dir for this process/worker. This must run
+        # before any video decode. The FASTWAM_FRAME_CACHE_DIR env var also works
+        # standalone; an explicit arg here overrides it. Passing None leaves whatever
+        # the env var set (so env-only usage stays back-compatible).
+        if frame_cache_dir is not None:
+            set_frame_cache_dir(frame_cache_dir)
+        self.frame_cache_dir = frame_cache_dir
+
         self.lerobot_dataset = BaseLerobotDataset(
             dataset_dirs=dataset_dirs,
             shape_meta=OmegaConf.to_container(shape_meta, resolve=True),

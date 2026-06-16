@@ -568,8 +568,36 @@ class Wan22Trainer:
     def _save_weights_checkpoint(self, step_tag: str):
         model = self.accelerator.unwrap_model(self.model)
         ckpt_path = os.path.join(self.weights_dir, f"{step_tag}.pt")
-        model.save_checkpoint(ckpt_path, optimizer=None, step=self.global_step)
+        if hasattr(model, "state_payload"):
+            # FSDP-safe: the state_dict all-gather is collective, so build the payload
+            # on EVERY rank, then write only on the main process. (Calling save on a
+            # single rank hangs the gather -> NCCL watchdog SIGABRT.)
+            payload = self._build_state_payload(model)
+            if self.accelerator.is_main_process:
+                torch.save(payload, ckpt_path)
+        elif self.accelerator.is_main_process:
+            model.save_checkpoint(ckpt_path, optimizer=None, step=self.global_step)
         return ckpt_path
+
+    def _build_state_payload(self, model):
+        """Build a self-contained weights payload with a CORRECTLY consolidated FSDP
+        full state dict.
+
+        Under FSDP we must NOT gather via ``model.state_payload()`` -> ``self.dit
+        .state_dict()``: ``self.dit`` is a *fresh* ``nn.ModuleDict`` (a property), not
+        the FSDP root ``self.model``. Per-``Block`` FSDP units consolidate via their own
+        hooks, but the ROOT-level params (x_embedder/t_embedder/final_layer/heads/
+        text_proj/video_feat_proj/proprio_encoder) are owned by ``self.model``'s root
+        FlatParameter -- accessing them through ``self.dit`` bypasses that root hook and
+        yields raw flat/empty tensors (corrupt .pt). ``accelerator.get_state_dict``
+        consolidates ALL params correctly (the same path that writes a valid
+        ``pytorch_model_fsdp.bin``), offloads to CPU and is rank0-only, so it also keeps
+        GPU0 flat (preserving the OOM fix). The gather is collective -> call on EVERY
+        rank; non-main ranks get an empty dict and only rank0 writes the file."""
+        if "FSDP" not in str(self.accelerator.distributed_type):
+            return model.state_payload(step=self.global_step)
+        full_sd = self.accelerator.get_state_dict(self.model)  # consolidated, CPU, rank0-only
+        return {"model": full_sd, "step": int(self.global_step)}
 
     def _save_trainer_state(self, state_path: str):
         state_file = os.path.join(state_path, "trainer_state.json")
@@ -585,9 +613,9 @@ class Wan22Trainer:
         step_tag = f"step_{self.global_step:06d}"
 
         self.accelerator.wait_for_everyone()
-        ckpt_path = None
-        if self.accelerator.is_main_process:
-            ckpt_path = self._save_weights_checkpoint(step_tag=step_tag)
+        # Call on ALL ranks: _save_weights_checkpoint runs the collective FSDP
+        # state_dict gather (writes only on the main process internally).
+        ckpt_path = self._save_weights_checkpoint(step_tag=step_tag)
         self.accelerator.wait_for_everyone()
 
         state_path = os.path.join(self.state_dir, step_tag)
@@ -597,7 +625,51 @@ class Wan22Trainer:
             self._save_trainer_state(state_path)
         self.accelerator.wait_for_everyone()
 
+        # The FSDP FULL_STATE_DICT gathers all params to rank 0 (both the weights .pt
+        # and accelerator.save_state); PyTorch's caching allocator then keeps that
+        # ~full-model buffer reserved on rank 0's GPU, leaving GPU0 ~15GB above the
+        # other ranks until the process exits. Release it so GPU0 stays balanced
+        # between saves (it only transiently spikes during the gather itself).
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        # Rotate: keep only the last N step checkpoints (state dirs + weights .pt).
+        # Each FSDP FULL_STATE_DICT checkpoint is the full model + optimizer (tens of
+        # GB); without rotation the disk fills and training crash-loops on resume.
+        if self.accelerator.is_main_process:
+            self._rotate_checkpoints(keep_last_n=int(getattr(self, "keep_last_checkpoints", 2)))
+        self.accelerator.wait_for_everyone()
+
         return {"weights_path": ckpt_path, "state_path": state_path}
+
+    def _rotate_checkpoints(self, keep_last_n: int = 2):
+        """Delete all but the last ``keep_last_n`` step checkpoints under state_dir
+        (step_* dirs) and weights_dir (step_*.pt), ordered by step number."""
+        import re
+        import shutil
+        if keep_last_n <= 0:
+            return
+
+        def _step_of(name):
+            m = re.search(r"step_(\d+)", name)
+            return int(m.group(1)) if m else -1
+
+        for root, is_dir in ((self.state_dir, True), (self.weights_dir, False)):
+            try:
+                entries = sorted(
+                    (e for e in os.listdir(root) if e.startswith("step_")), key=_step_of
+                )
+            except FileNotFoundError:
+                continue
+            for e in entries[:-keep_last_n]:
+                p = os.path.join(root, e)
+                try:
+                    if is_dir and os.path.isdir(p):
+                        shutil.rmtree(p, ignore_errors=True)
+                    elif (not is_dir) and e.endswith(".pt"):
+                        os.remove(p)
+                except OSError:
+                    pass
 
     def load_training_state(self, state_dir: str):
         self.accelerator.load_state(input_dir=state_dir)
@@ -672,7 +744,16 @@ class Wan22Trainer:
                 train_model = self.model if hasattr(self.model, "training_loss") else self.accelerator.unwrap_model(self.model)
 
                 with self.accelerator.autocast():
-                    loss, loss_dict = train_model.training_loss(sample)
+                    # Under FSDP, calling the .training_loss() method directly bypasses
+                    # FSDP's forward pre-hook that all-gathers the sharded params, so
+                    # root-level Linears come out as their 1-D flat shard ("mat2 must be
+                    # a matrix, got 1-D tensor"). Route through __call__/forward instead
+                    # so params are unsharded; FastWAMCosmos.forward returns the same
+                    # (loss, dict). Other backends (DeepSpeed/DDP) keep the direct call.
+                    if "FSDP" in str(self.accelerator.distributed_type):
+                        loss, loss_dict = self.model(sample)
+                    else:
+                        loss, loss_dict = train_model.training_loss(sample)
                 self.accelerator.backward(loss)
 
                 if self.accelerator.sync_gradients:

@@ -105,6 +105,42 @@ def mot_block_forward(
     bidirectional: bool = False,
     video_mask: Optional[torch.Tensor] = None,
     action_mask: Optional[torch.Tensor] = None,
+    use_checkpoint: bool = False,
+):
+    """One MoT layer (optionally activation-checkpointed).
+
+    The cosmos SAC wraps ``Block.forward``, which MoT bypasses, so per-layer activation
+    checkpointing for the MoT path is done HERE: with ``use_checkpoint`` the layer's
+    activations are recomputed in backward (``torch.utils.checkpoint``) — needed to fit
+    a large micro-batch (e.g. bs16). Streams are mutated in place either way."""
+    if use_checkpoint and torch.is_grad_enabled() and (
+        video.x.requires_grad or action.x.requires_grad
+    ):
+        import torch.utils.checkpoint as _cp
+
+        def _fn(vx, ax):
+            video.x = vx
+            action.x = ax
+            _mot_block_compute(video_block, action_block, video, action,
+                               bidirectional, video_mask, action_mask)
+            return video.x, action.x
+
+        vx, ax = _cp.checkpoint(_fn, video.x, action.x, use_reentrant=False)
+        video.x = vx
+        action.x = ax
+        return video, action
+    return _mot_block_compute(video_block, action_block, video, action,
+                              bidirectional, video_mask, action_mask)
+
+
+def _mot_block_compute(
+    video_block,
+    action_block,
+    video: CosmosMoTStream,
+    action: CosmosMoTStream,
+    bidirectional: bool = False,
+    video_mask: Optional[torch.Tensor] = None,
+    action_mask: Optional[torch.Tensor] = None,
 ):
     """One MoT layer: per-stream self/joint attention then per-stream cross-attn + MLP.
 

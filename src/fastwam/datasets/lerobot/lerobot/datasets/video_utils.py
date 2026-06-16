@@ -14,19 +14,172 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import glob
+import hashlib
 import importlib
+import json
 import logging
+import os
 import warnings
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, ClassVar
 
 import av
+import numpy as np
 import pyarrow as pa
 import torch
 import torchvision
 from datasets.features.features import register_feature
 from PIL import Image
+
+
+# ---------------------------------------------------------------------------
+# Pre-decoded frame cache (opt-in)
+#
+# To eliminate the runtime mp4 decode bottleneck, frames for each episode/camera
+# can be decoded ONCE, resized to the per-camera target (uint8 [N, 3, 224, 224]),
+# and stored to disk. When `FASTWAM_FRAME_CACHE_DIR` is set (env var or via
+# `set_frame_cache_dir`), `decode_video_frames` serves frames from this cache
+# instead of decoding the mp4. The output contract is identical to the real
+# decode: float32 in [0, 1], shape [N, 3, H, W].
+#
+# The cache is opt-in and falls back to the real decode (with a one-time warning)
+# if a particular file is missing, so it is fully back-compatible.
+# ---------------------------------------------------------------------------
+
+# Read once at import time; can be overridden per-process via set_frame_cache_dir.
+_FRAME_CACHE_DIR: Path | None = (
+    Path(os.environ["FASTWAM_FRAME_CACHE_DIR"])
+    if os.environ.get("FASTWAM_FRAME_CACHE_DIR")
+    else None
+)
+
+# Track paths we've already warned about so the fallback warning only fires once each.
+_MISSING_CACHE_WARNED: set[str] = set()
+
+
+def set_frame_cache_dir(path: str | Path | None) -> None:
+    """Set (or clear) the pre-decoded frame cache directory for this process.
+
+    Must be called inside each DataLoader worker (e.g. from the dataset __init__)
+    so the global is set after fork/spawn. The `FASTWAM_FRAME_CACHE_DIR` env var
+    also works standalone (read at import time).
+    """
+    global _FRAME_CACHE_DIR
+    _FRAME_CACHE_DIR = Path(path) if path is not None else None
+
+
+def get_frame_cache_dir() -> Path | None:
+    return _FRAME_CACHE_DIR
+
+
+def frame_cache_path(video_path: Path | str, cache_dir: Path | str) -> Path:
+    """Map an mp4 `video_path` to its cached-frames `.npz` path under `cache_dir`.
+
+    This is the SINGLE source of truth for the cache key and MUST be used by both
+    `decode_video_frames` (read) and `scripts/precompute_frames.py` (write) so the
+    keys match.
+
+    The key prefers a dataset-relative layout (so it mirrors the mp4 tree under the
+    cache dir, e.g. ``videos/chunk-000/observation.images.cam/episode_000000.mp4``
+    -> ``<cache>/videos/chunk-000/observation.images.cam/episode_000000.npy``). The
+    dataset root is detected as the parent of the ``videos/`` component of the path.
+    If no ``videos/`` component is present, we fall back to a stable sha1 hash of the
+    absolute path (reproducible across processes for the same absolute path).
+
+    The frames are stored as a single ``.npy`` (so it is truly memory-mappable);
+    the per-video ``fps`` is stored alongside in a tiny ``.fps.json`` sidecar (see
+    `frame_cache_meta_path`).
+    """
+    video_path = Path(video_path)
+    cache_dir = Path(cache_dir)
+
+    parts = video_path.parts
+    rel: Path | None = None
+    # Find the LAST "videos" component and key relative to it, so the cache mirrors
+    # the on-disk videos/ subtree regardless of where the dataset root lives. INCLUDE
+    # the dataset-dir component just before "videos/" (e.g. libero_spatial_no_noops_
+    # lerobot) so episodes that share the same chunk/camera/episode-number across
+    # DIFFERENT datasets (libero_spatial vs libero_object) do NOT collide to the same
+    # cache key — that collision would silently serve the wrong suite's frames.
+    for i in range(len(parts) - 1, -1, -1):
+        if parts[i] == "videos":
+            start = max(i - 1, 0)
+            rel = Path(*parts[start:])  # "<dataset_dir>/videos/chunk-.../episode_XXX"
+            break
+
+    if rel is not None:
+        out = cache_dir / rel
+    else:
+        # Stable, reproducible fallback: hash the absolute path string.
+        digest = hashlib.sha1(str(video_path.resolve()).encode("utf-8")).hexdigest()
+        out = cache_dir / f"{digest}"
+
+    return out.with_suffix(".npy")
+
+
+def frame_cache_meta_path(video_path: Path | str, cache_dir: Path | str) -> Path:
+    """Sidecar JSON path holding ``{"fps": ...}`` next to the cached ``.npy`` frames."""
+    frames_path = frame_cache_path(video_path, cache_dir)
+    return frames_path.with_suffix(".fps.json")
+
+
+@lru_cache(maxsize=64)
+def _load_cached_frames(cache_path_str: str):
+    """Memory-map a cached-frames .npy once per worker (LRU over recent episodes).
+
+    Returns (frames_uint8_memmap [N, 3, 224, 224], fps_float) or raises on failure.
+    `np.load(mmap_mode="r")` on a plain .npy keeps the array on disk and pages it in
+    lazily, so repeated reads of the same episode are cheap and memory stays bounded.
+    fps is read from the tiny .fps.json sidecar.
+    """
+    frames = np.load(cache_path_str, mmap_mode="r")  # uint8 [N, 3, H, W], memmap
+    meta_path = Path(cache_path_str).with_suffix(".fps.json")
+    with open(meta_path, "r", encoding="utf-8") as fh:
+        fps = float(json.load(fh)["fps"])
+    return frames, fps
+
+
+def _decode_from_cache(video_path: Path | str, timestamps: list[float]) -> torch.Tensor | None:
+    """Serve `timestamps` from the frame cache. Returns None to signal fallback.
+
+    Mirrors the torchcodec index selection: `indices = [round(ts * fps)]`, then
+    returns float32 in [0, 1] with shape [N, 3, H, W] (here H=W=224).
+    """
+    cache_dir = _FRAME_CACHE_DIR
+    if cache_dir is None:
+        return None
+
+    cache_path = frame_cache_path(video_path, cache_dir)
+    if not cache_path.is_file():
+        key = str(cache_path)
+        if key not in _MISSING_CACHE_WARNED:
+            _MISSING_CACHE_WARNED.add(key)
+            logging.warning(
+                f"FASTWAM_FRAME_CACHE_DIR is set but no cached frames at {cache_path} "
+                f"(for {video_path}); falling back to real mp4 decode for this file."
+            )
+        return None
+
+    try:
+        frames, fps = _load_cached_frames(str(cache_path))
+        num_frames = frames.shape[0]
+        # Same index math as decode_video_frames_torchcodec, clamped to be safe.
+        indices = [min(max(int(round(ts * fps)), 0), num_frames - 1) for ts in timestamps]
+        # Copy out of the memmap before converting to a torch tensor.
+        selected = np.ascontiguousarray(frames[indices])  # uint8 [N, 3, H, W]
+        out = torch.from_numpy(selected).to(torch.float32) / 255.0
+        return out
+    except Exception as err:  # noqa: BLE001 - any cache failure should fall back
+        key = str(cache_path)
+        if key not in _MISSING_CACHE_WARNED:
+            _MISSING_CACHE_WARNED.add(key)
+            warnings.warn(
+                f"Failed to read frame cache {cache_path} ({type(err).__name__}: {err}); "
+                "falling back to real mp4 decode for this file."
+            )
+        return None
 
 
 def get_safe_default_codec():
@@ -59,6 +212,13 @@ def decode_video_frames(
 
     Currently supports torchcodec on cpu and pyav.
     """
+    # Pre-decoded frame cache short-circuit (opt-in via FASTWAM_FRAME_CACHE_DIR /
+    # set_frame_cache_dir). Returns float32 [0,1] [N,3,224,224] matching the real
+    # decode contract; returns None to fall back to mp4 decoding below.
+    cached = _decode_from_cache(video_path, timestamps)
+    if cached is not None:
+        return cached
+
     if backend is None:
         backend = get_safe_default_codec()
     if backend == "torchcodec":

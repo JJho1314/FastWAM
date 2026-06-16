@@ -53,8 +53,8 @@ echo "[sbatch] node=$(hostname) gpus=$NPROC python=$COSMOS_PY wandb=${WANDB_BASE
 W=/data/user/jhe724/workspace/weights/Cosmos-Predict2.5-2B
 CKPT=$W/base/pre-trained/d20b7120-df3e-4911-919d-db6e08bad31c_ema_bf16.pt
 
-# 128 global batch = per-GPU 2 x 8 GPUs x grad-accum 8 (heavy 4B model; tune once
-# the memory profile is known). 10 epochs.
+# 512 global batch = per-GPU 2 x 8 GPUs x grad-accum 32 (heavy 4B model; per-GPU
+# batch kept at 2 for memory, larger global batch via accumulation). 10 epochs.
 "$COSMOS_PY" -m accelerate.commands.launch \
   --config_file "${ACCEL_CFG:-scripts/accelerate_configs/accelerate_fsdp_sana.yaml}" \
   --num_processes "$NPROC" \
@@ -63,5 +63,5 @@ CKPT=$W/base/pre-trained/d20b7120-df3e-4911-919d-db6e08bad31c_ema_bf16.pt
   "model.vae.vae_pth=${W}/tokenizer.pth" \
   wandb.enabled=true wandb.mode=online \
   "wandb.workspace=${WANDB_ENTITY_}" "wandb.project=${WANDB_PROJECT_}" "wandb.name=${WANDB_NAME_}" \
-  batch_size=2 gradient_accumulation_steps=8 num_epochs=10 \
+  batch_size=2 gradient_accumulation_steps=32 num_epochs=10 \
   ${EXTRA:-}
