@@ -18,13 +18,20 @@ feature_layer: -1          # unused for agra (multi-layer bridge is fixed: {0,4,
 atten_backend: torch
 train_video_expert: true
 
-# AGRA action head (ForesightActionHead) hyperparameters (paper cross-attn part):
+# AGRA action head. "gr00t" = the REAL GR00T-N1.7 flow-matching action DiT (32-layer
+# interleaved -> 16 cross blocks, inner 1536, cross-attn 2048), initialised from the
+# pretrained action_head.model.* weights (the paper's "employ the action DiT from
+# GR00T-N1"); its 16 cross blocks read the 16-layer Cosmos foresight bridge. State/action
+# use fresh LIBERO-dim Linears + FastWAM's own normalisation. "foresight" = the
+# standalone reimpl (agra_num_layers/hidden/num_heads below apply only to it).
+agra_head: gr00t
+gr00t_action_dit_ckpt: /data/users/junjie/weights/gr00t_n1d7_action_dit.pt
 action_horizon: null       # K (chunk length); informational only — the head is length-agnostic
                            # (LIBERO uses K=32: action_video_freq_ratio 4 x 8 video latents)
-agra_num_layers: 8
-agra_hidden: 1024
-agra_num_heads: 32
-agra_crossattn_dim: 2048
+agra_num_layers: 8         # (foresight head only)
+agra_hidden: 1024          # (foresight head only)
+agra_num_heads: 32         # (foresight head only)
+agra_crossattn_dim: 2048   # foresight cross-attn dim (= GR00T backbone_embedding_dim)
 
 vae:
   vae_pth: /data/user/jhe724/workspace/weights/Cosmos-Predict2.5-2B/tokenizer.pth

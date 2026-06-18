@@ -40,15 +40,27 @@ class AGRACoupling(Coupling):
     name = "agra"
 
     def setup(self, model) -> None:
-        # per-layer projection of the video hidden (model_channels) -> crossattn dim
-        # (2048). One per action layer; submodules on the model so FSDP/optimizer see
-        # them. The action head itself is built in runtime.create_fastwam_cosmos and
+        # per-layer projection of the video hidden (model_channels) -> the action head's
+        # cross-attn dim. One per action CROSS block; submodules on the model so
+        # FSDP/optimizer see them. The action head itself is built in
+        # runtime.create_fastwam_cosmos (ForesightActionHead OR the real GR00T DiT) and
         # set as model.action_expert (read via model.action_head property below).
+        #
+        # #contexts (= #cross blocks) and the cross-attn dim are read from the action
+        # head: ForesightActionHead -> 8; GR00T DiT (32-layer interleaved) -> 16. The
+        # multi-layer bridge (Eq.14) maps the video DiT's M blocks onto those N contexts:
+        # layer round(j*(M-1)/(N-1)) feeds cross block j.
+        from ..gr00t_action_dit import bridge_video_layers
+
         vdim = int(getattr(model.video_expert.net, "model_channels", AGRA_CROSSATTN_DIM))
+        head = model.action_head
+        n_ctx = int(getattr(head, "num_contexts", len(AGRA_VIDEO_LAYERS)))
+        cdim = int(getattr(head, "crossattn_dim", AGRA_CROSSATTN_DIM))
+        n_vblocks = len(model.video_expert.net.blocks)
+        model.agra_video_layers = bridge_video_layers(n_vblocks, n_ctx)
         model.agra_video_projs = nn.ModuleList(
-            [nn.Linear(vdim, AGRA_CROSSATTN_DIM) for _ in range(len(AGRA_VIDEO_LAYERS))]
+            [nn.Linear(vdim, cdim) for _ in range(n_ctx)]
         ).to(device=model.device, dtype=model.torch_dtype)
-        model.agra_video_layers = list(AGRA_VIDEO_LAYERS)
 
     def forward(self, model, noisy_latents, t_v, noisy_action, t_a, crossattn_emb):
         # (a) random-tau_v forward -> pred_v for the video loss (same as cross_attn).
@@ -56,12 +68,15 @@ class AGRACoupling(Coupling):
             noisy_latents, t_v, crossattn_emb, feature_layer=-1
         )
 
-        # (b) foresight pass at FIXED tau_v=1 (pure noise), o0-conditioned.
+        # (b) foresight pass at FIXED sigma=1 (pure noise), o0-conditioned.
         noise = torch.randn_like(noisy_latents)
         B, _, T = noise.shape[0], noise.shape[1], noise.shape[2]
-        # per-frame timesteps: tau=1 (pure noise) everywhere; the o0-conditioning
-        # path inside forward_foresight overrides the first frame to ~clean.
-        ts = noise.new_ones(B, T)
+        # per-frame timesteps: pure noise (sigma=1) everywhere; the o0-conditioning
+        # path inside forward_foresight overrides the first frame to ~clean (t=0).
+        # NB: the scheduler convention is t in [0, num_train_timesteps] (sigma = t/N),
+        # so pure noise is t=N (NOT 1.0 — that would be sigma~0, i.e. near-clean, which
+        # mismatches the pure-noise input and yields garbage foresight features).
+        ts = noise.new_full((B, T), float(model.train_video_scheduler.num_train_timesteps))
         feats = model.video_expert.forward_foresight(
             noise, ts, crossattn_emb,
             layers=getattr(model, "agra_video_layers", AGRA_VIDEO_LAYERS),

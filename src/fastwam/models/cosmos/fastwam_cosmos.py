@@ -320,7 +320,9 @@ class FastWAMCosmos(nn.Module):
             cond = min(int(cond_frames), T_lat)
             gen = None if seed is None else torch.Generator(device=rand_device).manual_seed(int(seed))
             noise = torch.randn((1, Cz, T_lat, hz, wz), generator=gen, device=rand_device).to(device, dtype)
-            ts1 = noise.new_ones(1, T_lat)  # tau_v=1; the o0 frame is overridden near-clean
+            # pure noise (sigma=1): t = num_train_timesteps (scheduler convention is
+            # t in [0,N], sigma=t/N), NOT 1.0. The o0 frame is overridden to t=0 inside.
+            ts1 = noise.new_full((1, T_lat), float(self.train_video_scheduler.num_train_timesteps))
             feats = self.video_expert.forward_foresight(
                 noise, ts1, crossattn, layers=self.agra_video_layers,
                 o0_latent=o0_latent, cond_frames=cond)

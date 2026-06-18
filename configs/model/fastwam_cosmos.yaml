@@ -12,6 +12,15 @@ feature_layer: -1          # cross_attn: which video block's hidden state the ac
 atten_backend: torch       # SDPA so the MoT joint masked attention + no-CP works
 train_video_expert: true
 
+# AGRA-only (passed always but IGNORED unless coupling=agra). "gr00t" = the REAL
+# GR00T-N1.7 flow-matching action DiT (32-layer interleaved -> 16 cross blocks, inner
+# 1536, cross-attn 2048), initialised from the pretrained action_head.model.* weights
+# (the paper's "employ the action DiT from GR00T-N1"); its 16 cross blocks read the
+# 16-layer Cosmos foresight bridge. (This is the model config the launcher actually
+# loads via task=libero_cosmos_2cam224; fastwam_cosmos_agra.yaml is unused by it.)
+agra_head: gr00t
+gr00t_action_dit_ckpt: /data/users/junjie/weights/gr00t_n1d7_action_dit.pt
+
 vae:
   vae_pth: /data/user/jhe724/workspace/weights/Cosmos-Predict2.5-2B/tokenizer.pth
 

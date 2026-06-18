@@ -235,6 +235,11 @@ class ForesightActionHead(nn.Module):
         nn.init.zeros_(self.head.weight)
         nn.init.zeros_(self.head.bias)
 
+    @property
+    def num_contexts(self) -> int:
+        """#cross-attn contexts the AGRA bridge must supply (one per layer here)."""
+        return self.num_layers
+
     def forward(self, noisy_action, t_a, proprio0, contexts):
         """See class docstring. ``contexts`` must have ``num_layers`` entries."""
         if len(contexts) != self.num_layers:

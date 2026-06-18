@@ -60,6 +60,11 @@ def create_fastwam_cosmos(
     agra_hidden: int = 1024,
     agra_num_heads: int = 32,
     agra_crossattn_dim: int = 2048,
+    # AGRA action head: "gr00t" = the REAL GR00T-N1.7 flow-matching action DiT
+    # (32-layer/1536, pretrained init from gr00t_action_dit_ckpt — the paper's
+    # "employ the action DiT from GR00T-N1"); "foresight" = the standalone reimpl.
+    agra_head: str = "gr00t",
+    gr00t_action_dit_ckpt: str | None = None,
     video_scheduler=None,
     action_scheduler=None,
     loss=None,
@@ -89,21 +94,44 @@ def create_fastwam_cosmos(
 
     # ---- action DiT ----
     if coupling == "agra":
-        # AGRA: a standalone 8-layer cross-attention DiT (ForesightActionHead) that
-        # reads the video DiT's multi-layer foresight. NOT a Cosmos-block expert and
-        # NOT copy-init from the video DiT (different depth/width). Requires proprio
-        # (the prepended state token s0).
+        # AGRA: a standalone cross-attention action DiT that reads the video DiT's
+        # multi-layer foresight (NOT a Cosmos-block expert, NOT copy-init from the
+        # video DiT). Requires proprio (the prepended state token s0).
         if proprio_dim is None:
             raise ValueError("coupling=agra requires proprio_dim (the prepended s0 token).")
-        action_expert = ForesightActionHead(
-            action_dim=action_dim,
-            proprio_dim=int(proprio_dim),
-            num_layers=int(agra_num_layers),
-            hidden=int(agra_hidden),
-            num_heads=int(agra_num_heads),
-            crossattn_dim=int(agra_crossattn_dim),
-            action_horizon=action_horizon,
-        )
+        nt = int((video_scheduler or {}).get("num_train_timesteps", 1000))
+        if str(agra_head) == "gr00t":
+            # The paper's faithful action head: GR00T-N1.7's REAL flow-matching action
+            # DiT (32-layer interleaved, inner 1536, cross-attn 2048), initialised from
+            # the pretrained action_head.model.* weights. Its 16 cross blocks read the
+            # 16-layer Cosmos foresight bridge; state/action use fresh LIBERO-dim layers.
+            from .gr00t_action_dit import Gr00tActionDiTHead
+            action_expert = Gr00tActionDiTHead(
+                action_dim=action_dim,
+                proprio_dim=int(proprio_dim),
+                crossattn_dim=int(agra_crossattn_dim),
+                action_horizon=action_horizon,
+                flow_t_max=float(nt),
+                model_dtype=model_dtype,
+            )
+            if gr00t_action_dit_ckpt:
+                sd = torch.load(gr00t_action_dit_ckpt, map_location="cpu", weights_only=False)
+                miss, unexp = action_expert.load_gr00t_dit(dict(sd), strict=True)
+                logger.info("GR00T action-DiT init from %s: %d tensors (missing=%d unexpected=%d)",
+                            gr00t_action_dit_ckpt, len(sd), len(miss), len(unexp))
+            else:
+                logger.warning("coupling=agra agra_head=gr00t but no gr00t_action_dit_ckpt "
+                               "given -> action DiT is RANDOM init (not the GR00T prior).")
+        else:
+            action_expert = ForesightActionHead(
+                action_dim=action_dim,
+                proprio_dim=int(proprio_dim),
+                num_layers=int(agra_num_layers),
+                hidden=int(agra_hidden),
+                num_heads=int(agra_num_heads),
+                crossattn_dim=int(agra_crossattn_dim),
+                action_horizon=action_horizon,
+            )
         action_expert = action_expert.to(device=device, dtype=model_dtype)
     else:
         # mot / cross_attn: Cosmos-block action expert (copy-init from the video DiT).
