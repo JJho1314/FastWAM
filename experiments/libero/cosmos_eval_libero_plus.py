@@ -49,23 +49,23 @@ from libero.libero import get_libero_path  # noqa
 
 W = "/data/users/junjie/weights/Cosmos-Predict2.5-2B"
 BASE_CKPT = W + "/base/pre-trained/d20b7120-df3e-4911-919d-db6e08bad31c_ema_bf16.pt"
+POSTTRAIN_CKPT = W + "/base/post-trained/81edfebe-bd6a-4039-8c1d-737df1a790bf_ema_bf16.pt"
 VAE_PTH = W + "/tokenizer.pth"
 DEFAULT_RUN_DIR = REPO + "/runs/train/2026-06-17_17-00-14"   # GR00T-AGRA run
 DATA_CFG = REPO + "/configs/data/libero_2cam_cosmos.yaml"
 TASK_CLS = LIBERO_PLUS + "/libero/libero/benchmark/task_classification.json"
 
 
-def build_model(device, dtype, run_dir, coupling):
+def build_model(device, dtype, coupling, ckpt_path, base_ckpt):
     model = create_fastwam_cosmos(
-        video_dit_pretrained_path=BASE_CKPT,
+        video_dit_pretrained_path=base_ckpt,
         vae={"vae_pth": VAE_PTH},
         action_dim=7, proprio_dim=8, crossattn_dim=1024,
         coupling=coupling, feature_layer=-1, action_horizon=None,
         model_dtype=dtype, device=device,
     )
-    ckpt = run_dir + "/checkpoints/weights/step_021700.pt"
-    model.load_checkpoint(ckpt)
-    logging.info("loaded %s ckpt: %s", coupling, ckpt)
+    model.load_checkpoint(ckpt_path)
+    logging.info("loaded %s ckpt: %s", coupling, ckpt_path)
     return model.to(device).eval()
 
 
@@ -84,6 +84,7 @@ def build_cfg(args):
         "binarize_gripper": True,
         "use_action_ensembler": False,
         "visualize_future_video": False,
+        "save_rollout_video": args.save_videos,
         "action_horizon": None,
         "num_inference_steps": args.num_inference_steps,
         "sigma_shift": None,
@@ -116,7 +117,11 @@ def main():
     ap.add_argument("--tag", default="")
     ap.add_argument("--coupling", default="agra")
     ap.add_argument("--run_dir", default=DEFAULT_RUN_DIR)
+    ap.add_argument("--ckpt", default=None)
+    ap.add_argument("--step", type=int, default=21700)
+    ap.add_argument("--base_ckpt", default=POSTTRAIN_CKPT)
     ap.add_argument("--exclude_categories", default="Sensor Noise")  # needs ImageMagick/wand
+    ap.add_argument("--save_videos", action=argparse.BooleanOptionalAction, default=True)
     args = ap.parse_args()
 
     device = "cuda:0"
@@ -126,8 +131,9 @@ def main():
     cat = load_categories()
     excl = set(c.strip() for c in args.exclude_categories.split(",") if c.strip())
 
-    model = build_model(device, dtype, args.run_dir, args.coupling)
-    dataset_stats = load_dataset_stats_from_json(args.run_dir + "/dataset_stats.json")
+    ckpt_path = args.ckpt or os.path.join(args.run_dir, "checkpoints", "weights", f"step_{args.step:06d}.pt")
+    model = build_model(device, dtype, args.coupling, ckpt_path, args.base_ckpt)
+    dataset_stats = load_dataset_stats_from_json(os.path.join(args.run_dir, "dataset_stats.json"))
     processor = instantiate(cfg.data.train.processor).eval()
     processor.set_normalizer_from_stats(dataset_stats)
 

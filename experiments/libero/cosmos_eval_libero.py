@@ -35,24 +35,22 @@ from libero.libero import get_libero_path  # noqa
 
 W = "/data/users/junjie/weights/Cosmos-Predict2.5-2B"
 BASE_CKPT = W + "/base/pre-trained/d20b7120-df3e-4911-919d-db6e08bad31c_ema_bf16.pt"
+POSTTRAIN_CKPT = W + "/base/post-trained/81edfebe-bd6a-4039-8c1d-737df1a790bf_ema_bf16.pt"
 VAE_PTH = W + "/tokenizer.pth"
-RUN_DIR = REPO + "/runs/train/2026-06-15_11-29-58"   # mot (Wan-faithful) global128 run
-CKPT = RUN_DIR + "/checkpoints/weights/step_021700.pt"
-STATS = RUN_DIR + "/dataset_stats.json"
+DEFAULT_RUN_DIR = REPO + "/runs/train/2026-06-15_11-29-58"   # mot (Wan-faithful) global128 run
 DATA_CFG = REPO + "/configs/data/libero_2cam_cosmos.yaml"
-COUPLING = "mot"
 
 
-def build_model(device, dtype):
+def build_model(device, dtype, coupling, ckpt_path, base_ckpt):
     model = create_fastwam_cosmos(
-        video_dit_pretrained_path=BASE_CKPT,
+        video_dit_pretrained_path=base_ckpt,
         vae={"vae_pth": VAE_PTH},
         action_dim=7, proprio_dim=8, crossattn_dim=1024,
-        coupling=COUPLING, feature_layer=-1,
+        coupling=coupling, feature_layer=-1,
         model_dtype=dtype, device=device,
     )
-    model.load_checkpoint(CKPT)  # DeepSpeed weights .pt {dit_cosmos,text_proj,proprio_encoder}
-    logging.info("loaded mot ckpt: %s", CKPT)
+    model.load_checkpoint(ckpt_path)  # DeepSpeed weights .pt {dit_cosmos,text_proj,proprio_encoder}
+    logging.info("loaded %s ckpt: %s", coupling, ckpt_path)
     return model.to(device).eval()
 
 
@@ -65,6 +63,7 @@ def build_cfg(args):
     cfg.EVALUATION = OmegaConf.create({
         "task_suite_name": None, "task_id": None,
         "num_trials": args.num_trials,
+        "trial_start": args.trial_start,
         "env_num": 1,
         "num_steps_wait": 30,
         "replan_steps": 10,
@@ -79,6 +78,7 @@ def build_cfg(args):
         "rand_device": "cpu",
         "tiled": False,
         "output_dir": args.out_dir,
+        "save_rollout_video": args.save_videos,
     })
     return cfg
 
@@ -89,10 +89,17 @@ def main():
     ap.add_argument("--task_ids", default="all")  # "all" or comma list
     ap.add_argument("--pairs", default="")  # explicit "suite:tid,suite:tid,..." (overrides suites/task_ids)
     ap.add_argument("--num_trials", type=int, default=20)
+    ap.add_argument("--trial_start", type=int, default=0)
+    ap.add_argument("--save_videos", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--num_inference_steps", type=int, default=10)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out_dir", default=REPO + "/evaluate_results/cosmos_crossattn")
     ap.add_argument("--tag", default="")  # unique per-process id (for multi-proc-per-GPU; avoids result-file collision)
+    ap.add_argument("--coupling", default="mot")
+    ap.add_argument("--run_dir", default=DEFAULT_RUN_DIR)
+    ap.add_argument("--ckpt", default=None)
+    ap.add_argument("--step", type=int, default=21700)
+    ap.add_argument("--base_ckpt", default=POSTTRAIN_CKPT)
     args = ap.parse_args()
 
     device = "cuda:0"
@@ -100,8 +107,9 @@ def main():
     os.makedirs(args.out_dir, exist_ok=True)
     cfg = build_cfg(args)
 
-    model = build_model(device, dtype)
-    dataset_stats = load_dataset_stats_from_json(STATS)
+    ckpt_path = args.ckpt or os.path.join(args.run_dir, "checkpoints", "weights", f"step_{args.step:06d}.pt")
+    model = build_model(device, dtype, args.coupling, ckpt_path, args.base_ckpt)
+    dataset_stats = load_dataset_stats_from_json(os.path.join(args.run_dir, "dataset_stats.json"))
     processor = instantiate(cfg.data.train.processor).eval()
     processor.set_normalizer_from_stats(dataset_stats)
 
@@ -140,6 +148,10 @@ def main():
         cfg.EVALUATION.task_id = tid
         task = ts.get_task(tid)
         inits = ts.get_task_init_states(tid)
+        trial_stop = int(args.trial_start) + int(args.num_trials)
+        while len(inits) < trial_stop:
+            inits.extend(inits[: trial_stop - len(inits)])
+        inits = inits[int(args.trial_start):trial_stop]
         vdir = os.path.join(args.out_dir, suite, "videos")
         os.makedirs(vdir, exist_ok=True)
         t0 = time.time()
@@ -152,7 +164,8 @@ def main():
         sc = int(res["successes"]); ep = int(args.num_trials)
         tot_succ += sc; tot_eps += ep
         rec = {"suite": suite, "task_id": tid, "successes": sc, "trials": ep,
-               "rate": sc / ep, "desc": res.get("task_description"), "sec": round(time.time() - t0, 1)}
+               "trial_start": int(args.trial_start), "rate": sc / ep,
+               "desc": res.get("task_description"), "sec": round(time.time() - t0, 1)}
         grand["by_task"].append(rec)
         bs = grand["by_suite"].setdefault(suite, {"successes": 0, "trials": 0})
         bs["successes"] += sc; bs["trials"] += ep; bs["rate"] = bs["successes"] / max(bs["trials"], 1)

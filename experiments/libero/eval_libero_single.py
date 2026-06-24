@@ -607,10 +607,13 @@ def run_single_task(
         results["episode_future_video_psnr"] = []
         results["future_video_psnr_mean"] = None
 
-    for trial_idx in range(int(cfg.EVALUATION.num_trials)):
+    trial_start = int(cfg.EVALUATION.get("trial_start", 0))
+    save_videos = bool(cfg.EVALUATION.get("save_rollout_video", True))
+    for local_trial_idx in range(int(cfg.EVALUATION.num_trials)):
+        trial_idx = trial_start + local_trial_idx
         success, replay_images, predicted_future_video_clips, episode_mean_psnr = run_single_episode(
             env=env,
-            initial_state=initial_states[trial_idx],
+            initial_state=initial_states[local_trial_idx],
             task_description=task_description,
             model=model,
             processor=processor,
@@ -629,13 +632,14 @@ def run_single_task(
         if visualize_future_video:
             results["episode_future_video_psnr"].append(episode_mean_psnr)
 
-        save_rollout_video(
-            video_dir,
-            replay_images,
-            f"task{cfg.EVALUATION.task_id}_trial{trial_idx}",
-            success=success,
-            task_description=task_description,
-        )
+        if save_videos:
+            save_rollout_video(
+                video_dir,
+                replay_images,
+                f"task{cfg.EVALUATION.task_id}_trial{trial_idx}",
+                success=success,
+                task_description=task_description,
+            )
         if visualize_future_video:
             if len(predicted_future_video_clips) == 0:
                 logging.warning(
@@ -736,8 +740,11 @@ def eval_single_process(cfg: DictConfig):
     task = task_suite.get_task(cfg.EVALUATION.task_id)
     initial_states = task_suite.get_task_init_states(cfg.EVALUATION.task_id)
 
-    while len(initial_states) < int(cfg.EVALUATION.num_trials):
-        initial_states.extend(initial_states[: (int(cfg.EVALUATION.num_trials) - len(initial_states))])
+    trial_start = int(cfg.EVALUATION.get("trial_start", 0))
+    trial_stop = trial_start + int(cfg.EVALUATION.num_trials)
+    while len(initial_states) < trial_stop:
+        initial_states.extend(initial_states[: (trial_stop - len(initial_states))])
+    initial_states = initial_states[trial_start:trial_stop]
 
     results = {
         "task_suite": cfg.EVALUATION.task_suite_name,

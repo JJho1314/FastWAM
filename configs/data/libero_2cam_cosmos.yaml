@@ -34,6 +34,21 @@ train:
   is_training_set: true
   skip_padding_as_possible: false
   concat_multi_camera: "horizontal"
+  video_augmentation:
+    _target_: fastwam.datasets.lerobot.transforms.image.VideoAugmentation
+    p: 0.65
+    augment_types: [corrupt_only, color_only, both, both]
+    color_jitter:
+      brightness: 0.3
+      contrast: 0.3
+      saturation: 0.25
+      hue: 0.04
+    gamma:
+      range: [0.8, 1.25]
+    gaussian_noise:
+      std: 0.015
+    exposure:
+      ev_range: [-0.25, 0.25]
   processor:
     _target_: fastwam.datasets.lerobot.processors.fastwam_processor.FastWAMProcessor
     shape_meta: ${data.train.shape_meta}

@@ -44,6 +44,8 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         concat_multi_camera: str = "horizontal", # "horizontal", "vertical", "robotwin", or None
         override_instruction: Optional[str] = None, # whether to hardcode a specific instruction for all samples, for debugging
         frame_cache_dir: Optional[str] = None, # pre-decoded frame cache dir; None = decode mp4 at runtime (back-compatible)
+        condition_frame_augmentation: Optional[dict] = None,
+        video_augmentation: Optional[dict] = None,
     ):
         # Set the pre-decoded frame cache dir for this process/worker. This must run
         # before any video decode. The FASTWAM_FRAME_CACHE_DIR env var also works
@@ -82,6 +84,14 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         self.max_padding_retry = max_padding_retry
         self.concat_multi_camera = concat_multi_camera
         self.override_instruction = override_instruction
+        augmentation_cfg = video_augmentation if video_augmentation is not None else condition_frame_augmentation
+        if augmentation_cfg is not None and is_training_set:
+            if isinstance(augmentation_cfg, torch.nn.Module):
+                self.video_augmentation = augmentation_cfg
+            else:
+                self.video_augmentation = instantiate(augmentation_cfg)
+        else:
+            self.video_augmentation = None
 
         self.resize_transform = ResizeSmallestSideAspectPreserving(
             args={"img_w": self.video_size[1], "img_h": self.video_size[0]},
@@ -161,6 +171,9 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         image_is_pad = image_is_pad[self.video_sample_indices]
 
         video = video.view(num_cameras, T_video, C, H, W)  # [num_cameras, T_video, C, H, W]
+        if self.video_augmentation is not None:
+            video = self.video_augmentation(video)
+
         if self.concat_multi_camera == "robotwin":
             if num_cameras != 3:
                 raise ValueError(
