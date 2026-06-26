@@ -12,6 +12,15 @@ feature_layer: -1          # cross_attn: which video block's hidden state the ac
 atten_backend: torch       # SDPA so the MoT joint masked attention + no-CP works
 train_video_expert: true
 
+# MoT/cross-attn action DiT width.  The previous implementation mirrored the
+# Cosmos video DiT (hidden=2048, ffn=8192) and made the action expert ~1.95B.
+# This Wan-style compact setting keeps MoT K/V compatible via 16x128 attention
+# width, but reduces the action residual/MLP width to ~0.80B total action params.
+# Set action_hidden_dim/action_ffn_dim to null to recover the old full-size mode.
+action_hidden_dim: 1024
+action_ffn_dim: 4096
+action_attention_head_dim: 128
+
 # AGRA-only (passed always but IGNORED unless coupling=agra). "gr00t" = the REAL
 # GR00T-N1.7 flow-matching action DiT (32-layer interleaved -> 16 cross blocks, inner
 # 1536, cross-attn 2048), initialised from the pretrained action_head.model.* weights

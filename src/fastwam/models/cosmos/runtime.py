@@ -54,6 +54,12 @@ def create_fastwam_cosmos(
     feature_layer: int = -1,
     atten_backend: str = "torch",
     train_video_expert: bool = True,
+    # --- MoT/cross-attn action DiT width.  None keeps the old full-size mirror of
+    # the Cosmos video DiT; 1024/4096 is the Wan-style compact default used by the
+    # task config.
+    action_hidden_dim: int | None = None,
+    action_ffn_dim: int | None = None,
+    action_attention_head_dim: int | None = None,
     # --- AGRA action-head (foresight cross-attention) hyperparameters ---
     action_horizon: int | None = None,   # K (chunk length); informational, head is length-agnostic
     agra_num_layers: int = 8,
@@ -141,6 +147,9 @@ def create_fastwam_cosmos(
             num_blocks=num_blocks,
             num_heads=num_heads,
             crossattn_emb_channels=crossattn_dim,
+            action_hidden_dim=action_hidden_dim,
+            action_ffn_dim=action_ffn_dim,
+            attention_head_dim=action_attention_head_dim,
         )
         action_expert.copy_init_from_video(net)
         action_expert = action_expert.to(device=device, dtype=model_dtype)

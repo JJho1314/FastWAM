@@ -20,7 +20,10 @@ def main():
     net = ve.net
     ae = CosmosActionExpert(action_dim=7, model_channels=net.model_channels,
                             num_blocks=len(net.blocks),
-                            num_heads=int(net.blocks[0].self_attn.n_heads))
+                            num_heads=int(net.blocks[0].self_attn.n_heads),
+                            action_hidden_dim=1024,
+                            action_ffn_dim=4096,
+                            attention_head_dim=128)
     ae.copy_init_from_video(net)
 
     model = FastWAMCosmos(ve, ae, vae=None, vae_encode_fn=None, crossattn_dim=1024,
@@ -28,6 +31,7 @@ def main():
     model = model.to(dev).to(torch.bfloat16).eval()
     n = sum(p.numel() for p in model.dit.parameters())
     print(f"FastWAMCosmos dit params: {n / 1e9:.3f}B")
+    print(f"Action expert params: {sum(p.numel() for p in ae.parameters()) / 1e9:.3f}B")
 
     B, C, T, H, W, Ta = 1, 16, 4, 16, 16, 8
     noisy_v = torch.randn(B, C, T, H, W, device=dev, dtype=torch.bfloat16)
@@ -37,7 +41,7 @@ def main():
     crossattn = torch.randn(B, 16, 1024, device=dev, dtype=torch.bfloat16)
 
     with torch.no_grad():
-        pred_v, pred_a = model.mot_forward(noisy_v, t_v, noisy_a, t_a, crossattn)
+        pred_v, pred_a = model.couple_forward(noisy_v, t_v, noisy_a, t_a, crossattn)
     print("pred_v:", tuple(pred_v.shape), "pred_a:", tuple(pred_a.shape))
     assert pred_v.shape[1] == 16, pred_v.shape
     assert pred_a.shape[-1] == 7, pred_a.shape

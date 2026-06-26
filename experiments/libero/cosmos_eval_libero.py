@@ -41,16 +41,19 @@ DEFAULT_RUN_DIR = REPO + "/runs/train/2026-06-15_11-29-58"   # mot (Wan-faithful
 DATA_CFG = REPO + "/configs/data/libero_2cam_cosmos.yaml"
 
 
-def build_model(device, dtype, coupling, ckpt_path, base_ckpt):
+def build_model(device, dtype, args, ckpt_path):
     model = create_fastwam_cosmos(
-        video_dit_pretrained_path=base_ckpt,
+        video_dit_pretrained_path=args.base_ckpt,
         vae={"vae_pth": VAE_PTH},
         action_dim=7, proprio_dim=8, crossattn_dim=1024,
-        coupling=coupling, feature_layer=-1,
+        coupling=args.coupling, feature_layer=-1,
+        action_hidden_dim=args.action_hidden_dim,
+        action_ffn_dim=args.action_ffn_dim,
+        action_attention_head_dim=args.action_attention_head_dim,
         model_dtype=dtype, device=device,
     )
     model.load_checkpoint(ckpt_path)  # DeepSpeed weights .pt {dit_cosmos,text_proj,proprio_encoder}
-    logging.info("loaded %s ckpt: %s", coupling, ckpt_path)
+    logging.info("loaded %s ckpt: %s", args.coupling, ckpt_path)
     return model.to(device).eval()
 
 
@@ -100,6 +103,9 @@ def main():
     ap.add_argument("--ckpt", default=None)
     ap.add_argument("--step", type=int, default=21700)
     ap.add_argument("--base_ckpt", default=POSTTRAIN_CKPT)
+    ap.add_argument("--action_hidden_dim", type=int, default=1024)
+    ap.add_argument("--action_ffn_dim", type=int, default=4096)
+    ap.add_argument("--action_attention_head_dim", type=int, default=128)
     args = ap.parse_args()
 
     device = "cuda:0"
@@ -108,7 +114,7 @@ def main():
     cfg = build_cfg(args)
 
     ckpt_path = args.ckpt or os.path.join(args.run_dir, "checkpoints", "weights", f"step_{args.step:06d}.pt")
-    model = build_model(device, dtype, args.coupling, ckpt_path, args.base_ckpt)
+    model = build_model(device, dtype, args, ckpt_path)
     dataset_stats = load_dataset_stats_from_json(os.path.join(args.run_dir, "dataset_stats.json"))
     processor = instantiate(cfg.data.train.processor).eval()
     processor.set_normalizer_from_stats(dataset_stats)
